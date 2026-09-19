@@ -11,6 +11,9 @@ milestones are in [plan.md](plan.md).
 The design for replacing temporary whole-chapter buffers with a bounded
 streaming ZIP-to-page pipeline is in [streamingzip.md](streamingzip.md).
 
+The prioritized assessment and delivery order for the next structural
+refactor is in [refactor.md](refactor.md).
+
 ## Overview
 Write your [Playdate](https://play.date) game in [Zig](https://ziglang.org)!  Use this template as a starting point to write your games in Zig.  The `build.zig` will allow you to generate a Playdate `.pdx` executable that will work both in the simulator and on hardware.
 

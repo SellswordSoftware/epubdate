@@ -18,6 +18,8 @@ pub fn build(b: *std.Build) !void {
     // that do not need them.
     const test_roots = [_][]const u8{
         "src/app.zig",
+        "src/reader_input.zig",
+        "src/reader_transitions.zig",
         "src/chapter_browser.zig",
         "src/archive/deflate.zig",
         "src/archive/zip.zig",
@@ -34,8 +36,11 @@ pub fn build(b: *std.Build) !void {
         "src/publication/navigation.zig",
         "src/storage/library.zig",
         "src/storage/pace.zig",
+        "src/storage/persistence.zig",
+        "src/storage/reading_state.zig",
         "src/storage/resume.zig",
         "src/storage/settings.zig",
+        "src/storage/write_schedule.zig",
     };
     for (test_roots) |root| {
         const limits_module = b.createModule(.{

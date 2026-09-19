@@ -10,13 +10,17 @@ const pagination = @import("content/pagination.zig");
 const rsvp = @import("content/rsvp.zig");
 const epub = @import("publication/epub.zig");
 const publication_navigation = @import("publication/navigation.zig");
-const reading_position = @import("storage/resume.zig");
+const reading_state = @import("storage/reading_state.zig");
 const reading_pace = @import("storage/pace.zig");
 const reader_settings = @import("storage/settings.zig");
+const persistence = @import("storage/persistence.zig");
 const library_storage = @import("storage/library.zig");
+const reader_transitions = @import("reader_transitions.zig");
+const reader_input = @import("reader_input.zig");
 const pdapi = @import("playdate_api_definitions.zig");
 const PlaydateAllocator = @import("platform/playdate_allocator.zig").PlaydateAllocator;
 const PlaydateFileReader = @import("platform/playdate_file_reader.zig").PlaydateFileReader;
+const playdate_persistence = @import("platform/playdate_persistence.zig");
 
 pub const State = enum {
     library,
@@ -41,30 +45,7 @@ const FixtureState = enum {
 
 const ChapterFailure = enum { archive, tokenizer, page_limit, no_supported_text };
 
-const InputAction = enum {
-    none,
-    library_next,
-    library_previous,
-    open_selected_book,
-    return_to_library,
-    close_settings,
-    close_chapter_browser,
-    chapter_browser_next,
-    chapter_browser_previous,
-    open_browser_chapter,
-    settings_next,
-    settings_previous,
-    activate_setting,
-    toggle_reading_mode,
-    rsvp_toggle_autoplay,
-    rsvp_wpm_up,
-    rsvp_wpm_down,
-    rsvp_previous_sentence,
-    next_page,
-    previous_page,
-    next_chapter,
-    previous_chapter,
-};
+const InputAction = reader_input.Intent;
 
 const RsvpRescanTarget = union(enum) {
     word: u32,
@@ -79,12 +60,7 @@ const ChapterOpenAction = union(enum) {
     rescan_to_last_page,
 };
 
-const PagedSelectionTarget = union(enum) {
-    ordinal: u32,
-    // The preceding chapter is rebuilt to its final page before this target
-    // can be resolved, so its ordinal is not known at crank time.
-    last_word,
-};
+const PagedSelectionTarget = reader_transitions.PagedSelectionTarget;
 
 /// Opening advances through file open, EOCD scanning, and central-directory
 /// lookup in separate update ticks. Its archive reader points at App's stable
@@ -316,8 +292,7 @@ pub const App = struct {
     rsvp_timer: rsvp.Timer = .{},
     rsvp_active_session: reading_pace.ActiveSession = .{},
     pace: reading_pace.Stats = .{ .book_id = 0 },
-    pace_dirty: bool = false,
-    pace_delay_frames: u8 = 0,
+    persistence: persistence.Service,
     show_telemetry: bool = false,
     frame_count: u32 = 0,
     update_time_ms: u32 = 0,
@@ -422,8 +397,6 @@ pub const App = struct {
     rescan_to_last_page: bool = false,
     rescan_last_completed: u2 = 0,
     chapter_last_page: ?u32 = null,
-    resume_dirty: bool = false,
-    resume_delay_frames: u8 = 0,
     // The active pool retains the immediate previous/current/next pages.
     // Older pages are rebuilt incrementally from the chapter start.
     cache_navigation: bool = false,
@@ -445,6 +418,7 @@ pub const App = struct {
             .playdate = playdate,
             .allocator = allocator,
             .body_font = body_font,
+            .persistence = persistence.Service.init(playdate_persistence.fileStore(playdate.file)),
         };
         app.loadSettings();
         app.installSystemMenu();
@@ -555,10 +529,8 @@ pub const App = struct {
     fn returnToLibrary(self: *App) void {
         if (self.state == .library) return;
         self.stopRsvpAutoplay(self.playdate.system.getCurrentTimeMilliseconds());
-        if (self.pace_dirty) self.writePace();
+        _ = self.persistence.flushPendingPace(self.pace);
         if (self.fixture_state == .ready) {
-            self.resume_dirty = false;
-            self.resume_delay_frames = 0;
             self.writePosition();
         }
         if (self.opening_job != null) self.failOpening(.opening);
@@ -735,22 +707,13 @@ pub const App = struct {
     }
 
     fn loadSettings(self: *App) void {
-        const file = self.playdate.file.open("settings.bin", pdapi.FILE_READ | pdapi.FILE_READ_DATA) orelse return;
-        defer _ = self.playdate.file.close(file);
-        var bytes: [reader_settings.encoded_size]u8 = undefined;
-        if (self.playdate.file.read(file, &bytes, bytes.len) != bytes.len) return;
-        const settings = reader_settings.decode(&bytes) catch return;
+        const settings = self.persistence.loadSettings();
         self.reading_mode = settings.reading_mode;
         self.rsvp_wpm = settings.rsvp_wpm;
     }
 
     fn writeSettings(self: *App) void {
-        const file = self.playdate.file.open("settings.bin", pdapi.FILE_WRITE) orelse return;
-        defer _ = self.playdate.file.close(file);
-        var bytes: [reader_settings.encoded_size]u8 = undefined;
-        reader_settings.encode(.{ .reading_mode = self.reading_mode, .rsvp_wpm = self.rsvp_wpm }, &bytes);
-        if (self.playdate.file.write(file, &bytes, bytes.len) != bytes.len) return;
-        _ = self.playdate.file.flush(file);
+        _ = self.persistence.saveSettings(.{ .reading_mode = self.reading_mode, .rsvp_wpm = self.rsvp_wpm });
     }
 
     fn handleCrank(self: *App) void {
@@ -811,8 +774,7 @@ pub const App = struct {
         if (!self.rsvp_timer.running) return;
         if (self.rsvp_active_session.started_at_ms == null) return;
         self.rsvp_active_session.record(&self.pace, now_ms, completed_words);
-        self.pace_dirty = true;
-        self.pace_delay_frames = pace_debounce_frames;
+        self.persistence.requestWrite(.pace, pace_debounce_frames);
     }
 
     fn drawChapterError(self: *App) void {
@@ -1918,116 +1880,72 @@ pub const App = struct {
 
     fn restorePosition(self: *App) void {
         if (self.fixture_state != .ready) return;
-        var filename_buffer: [24]u8 = undefined;
-        const filename = self.resumeFilename(&filename_buffer) orelse return;
-        const file = self.playdate.file.open(filename.ptr, pdapi.FILE_READ | pdapi.FILE_READ_DATA) orelse return;
-        defer _ = self.playdate.file.close(file);
-        var bytes: [reading_position.encoded_size]u8 = undefined;
-        if (self.playdate.file.read(file, &bytes, bytes.len) != bytes.len) return;
-        const position = reading_position.decode(&bytes) catch return;
-        if (!reading_position.matches(position, self.bookIdentity(), layout_revision)) return;
-        if (position.chapter >= self.publication.spine_len) return;
-        const chapter: u8 = @intCast(position.chapter);
-        if (position.legacy_paged_page) |page| {
-            // Legacy Paged offsets have no word equivalent. Preserve their
-            // existing page rebuild behavior when opening Paged mode; an RSVP
-            // preference still gets the same safe chapter fallback.
-            if (self.reading_mode == .paged) self.scheduleOpenChapter(chapter, if (page == 0) .normal else .{ .rescan = page }) else self.scheduleOpenChapter(chapter, .normal);
-            return;
-        }
-        self.pending_mode_word_ordinal = position.word_ordinal;
-        switch (self.reading_mode) {
-            .paged => {
-                self.pending_paged_selection = .{ .ordinal = position.word_ordinal };
-                self.scheduleOpenChapter(chapter, .{ .word_rescan = position.word_ordinal });
+        const restored = self.persistence.loadPosition(self.bookIdentity(), layout_revision) orelse return;
+        switch (restored) {
+            .legacy_paged_page => |legacy| {
+                if (legacy.chapter >= self.publication.spine_len) return;
+                const chapter: u8 = @intCast(legacy.chapter);
+                // Legacy Paged offsets have no word equivalent. Preserve their
+                // existing page rebuild behavior when opening Paged mode; an RSVP
+                // preference still gets the same safe chapter fallback.
+                if (self.reading_mode == .paged) self.scheduleOpenChapter(chapter, if (legacy.page == 0) .normal else .{ .rescan = legacy.page }) else self.scheduleOpenChapter(chapter, .normal);
             },
-            .rsvp => self.scheduleOpenChapter(chapter, .{ .rsvp_rescan = .{ .word = position.word_ordinal } }),
+            .snapshot => |snapshot| {
+                if (snapshot.chapter >= self.publication.spine_len) return;
+                const chapter: u8 = @intCast(snapshot.chapter);
+                self.pending_mode_word_ordinal = snapshot.word_ordinal;
+                switch (self.reading_mode) {
+                    .paged => {
+                        self.pending_paged_selection = .{ .ordinal = snapshot.word_ordinal };
+                        self.scheduleOpenChapter(chapter, .{ .word_rescan = snapshot.word_ordinal });
+                    },
+                    .rsvp => self.scheduleOpenChapter(chapter, .{ .rsvp_rescan = .{ .word = snapshot.word_ordinal } }),
+                }
+            },
         }
     }
 
     fn savePosition(self: *App) void {
         if (self.fixture_state != .ready) return;
-        self.resume_dirty = true;
-        self.resume_delay_frames = resume_debounce_frames;
+        self.persistence.requestWrite(.position, resume_debounce_frames);
     }
 
     fn flushDebouncedPosition(self: *App) void {
-        if (!self.resume_dirty or self.fixture_state != .ready) return;
-        if (self.resume_delay_frames != 0) {
-            self.resume_delay_frames -= 1;
-            return;
-        }
-        self.resume_dirty = false;
-        self.writePosition();
+        if (self.fixture_state == .ready) _ = self.persistence.flushPositionIfDue(self.positionSnapshot());
     }
 
     fn loadPace(self: *App) void {
-        self.pace = .{ .book_id = self.bookIdentity() };
-        self.pace_dirty = false;
-        self.pace_delay_frames = 0;
-        var filename_buffer: [24]u8 = undefined;
-        const filename = self.paceFilename(&filename_buffer) orelse return;
-        const file = self.playdate.file.open(filename.ptr, pdapi.FILE_READ | pdapi.FILE_READ_DATA) orelse return;
-        defer _ = self.playdate.file.close(file);
-        var bytes: [reading_pace.encoded_size]u8 = undefined;
-        if (self.playdate.file.read(file, &bytes, bytes.len) != bytes.len) return;
-        const stored = reading_pace.decode(&bytes) catch return;
-        if (stored.book_id == self.bookIdentity()) self.pace = stored;
+        self.pace = self.persistence.loadPace(self.bookIdentity());
     }
 
     fn flushDebouncedPace(self: *App) void {
-        if (!self.pace_dirty) return;
-        if (self.pace_delay_frames != 0) {
-            self.pace_delay_frames -= 1;
-            return;
-        }
-        self.writePace();
+        _ = self.persistence.flushPaceIfDue(self.pace);
     }
 
     fn writePace(self: *App) void {
-        var filename_buffer: [24]u8 = undefined;
-        const filename = self.paceFilename(&filename_buffer) orelse return;
-        const file = self.playdate.file.open(filename.ptr, pdapi.FILE_WRITE) orelse return;
-        defer _ = self.playdate.file.close(file);
-        var bytes: [reading_pace.encoded_size]u8 = undefined;
-        reading_pace.encode(self.pace, &bytes);
-        if (self.playdate.file.write(file, &bytes, bytes.len) != bytes.len) return;
-        _ = self.playdate.file.flush(file);
-        self.pace_dirty = false;
-        self.pace_delay_frames = 0;
+        _ = self.persistence.flushPendingPace(self.pace);
     }
 
     fn writePosition(self: *App) void {
-        var filename_buffer: [24]u8 = undefined;
-        const filename = self.resumeFilename(&filename_buffer) orelse return;
-        const file = self.playdate.file.open(filename.ptr, pdapi.FILE_WRITE) orelse return;
-        defer _ = self.playdate.file.close(file);
-        var bytes: [reading_position.encoded_size]u8 = undefined;
-        reading_position.encode(.{
+        _ = self.persistence.flushPositionNow(self.positionSnapshot());
+    }
+
+    fn positionSnapshot(self: *const App) persistence.ReadingSnapshot {
+        return .{
             .book_id = self.bookIdentity(),
             .layout_revision = layout_revision,
             .chapter = self.chapter_index,
             .word_ordinal = self.pending_mode_word_ordinal orelse if (self.reading_mode == .rsvp) self.rsvp_position.word else self.currentPagedWordOrdinal(),
             .mode = self.resumeMode(),
-        }, &bytes);
-        if (self.playdate.file.write(file, &bytes, bytes.len) != bytes.len) return;
-        _ = self.playdate.file.flush(file);
+        };
     }
 
     fn bookIdentity(self: *const App) u32 {
-        return reading_position.bookIdentity(self.active_book.slice());
+        return persistence.Service.bookIdentity(self.active_book.slice());
     }
 
-    fn resumeMode(self: *const App) reading_position.Mode {
+    fn resumeMode(self: *const App) reading_state.Mode {
         return if (self.reading_mode == .rsvp) .rsvp else .paged;
-    }
-
-    fn resumeFilename(self: *const App, buffer: []u8) ?[:0]u8 {
-        return std.fmt.bufPrintZ(buffer, "resume-{x}.bin", .{self.bookIdentity()}) catch null;
-    }
-
-    fn paceFilename(self: *const App, buffer: []u8) ?[:0]u8 {
-        return std.fmt.bufPrintZ(buffer, "pace-{x}.bin", .{self.bookIdentity()}) catch null;
     }
 };
 
@@ -2079,12 +1997,7 @@ fn saturatingAddDetents(existing: i16, incoming: i16) i16 {
 /// next page. A mode switch must preserve that semantic destination rather
 /// than clearing it and handing RSVP the prior word.
 fn pagedModeSwitchOrdinal(current: u32, pending: ?PagedSelectionTarget) u32 {
-    return switch (pending orelse return current) {
-        .ordinal => |ordinal| ordinal,
-        // The preceding chapter's final ordinal is unknown until its bounded
-        // rebuild completes, so retain the still-drawable current word.
-        .last_word => current,
-    };
+    return reader_transitions.pagedModeSwitchOrdinal(current, pending);
 }
 
 /// Once a requested ordinal lies at or beyond the next ready page's start,
@@ -2095,49 +2008,31 @@ fn pendingOrdinalRequiresNextPage(page: *const pagination.PageCache, ordinal: u3
 }
 
 fn nextReadableSpineIndex(current: u8, spine_len: u8) ?u8 {
-    if (current + 1 < spine_len) return current + 1;
-    return null;
+    return reader_transitions.adjacentChapter(current, spine_len, 1);
 }
 
 /// Maps a pushed-button bitset to exactly one action. B has priority while
 /// reading, so a diagonal press cannot turn a page instead of changing modes.
 fn inputAction(state: State, fixture_state: FixtureState, reading_mode: reader_settings.ReadingMode, pushed: pdapi.PDButtons) InputAction {
-    if (state == .settings) {
-        if (pushed & pdapi.BUTTON_B != 0) return .close_settings;
-        if (pushed & pdapi.BUTTON_DOWN != 0) return .settings_next;
-        if (pushed & pdapi.BUTTON_UP != 0) return .settings_previous;
-        if (pushed & pdapi.BUTTON_A != 0) return .activate_setting;
-        return .none;
-    }
-    if (state == .chapter_browser) {
-        if (pushed & pdapi.BUTTON_B != 0) return .close_chapter_browser;
-        if (pushed & pdapi.BUTTON_A != 0) return .open_browser_chapter;
-        if (pushed & (pdapi.BUTTON_DOWN | pdapi.BUTTON_RIGHT) != 0) return .chapter_browser_next;
-        if (pushed & (pdapi.BUTTON_UP | pdapi.BUTTON_LEFT) != 0) return .chapter_browser_previous;
-        return .none;
-    }
-    if (state == .reading and pushed & pdapi.BUTTON_B != 0) return .toggle_reading_mode;
-    if (state == .library) {
-        if (pushed & (pdapi.BUTTON_DOWN | pdapi.BUTTON_RIGHT) != 0) return .library_next;
-        if (pushed & (pdapi.BUTTON_UP | pdapi.BUTTON_LEFT) != 0) return .library_previous;
-        if (pushed & pdapi.BUTTON_A != 0) return .open_selected_book;
-        return .none;
-    }
-    if (fixture_state == .chapter_error) {
-        if (pushed & (pdapi.BUTTON_RIGHT | pdapi.BUTTON_DOWN) != 0) return .next_chapter;
-        if (pushed & (pdapi.BUTTON_LEFT | pdapi.BUTTON_UP) != 0) return .previous_chapter;
-        return .none;
-    }
-    if (state == .reading and reading_mode == .rsvp) {
-        if (pushed & pdapi.BUTTON_A != 0) return .rsvp_toggle_autoplay;
-        if (pushed & pdapi.BUTTON_UP != 0) return .rsvp_wpm_up;
-        if (pushed & pdapi.BUTTON_DOWN != 0) return .rsvp_wpm_down;
-        if (pushed & pdapi.BUTTON_LEFT != 0) return .rsvp_previous_sentence;
-        return .none;
-    }
-    if (pushed & (pdapi.BUTTON_RIGHT | pdapi.BUTTON_DOWN) != 0) return .next_page;
-    if (pushed & (pdapi.BUTTON_LEFT | pdapi.BUTTON_UP) != 0) return .previous_page;
-    return .none;
+    return reader_input.intentFor(.{
+        .screen = switch (state) {
+            .library => .library,
+            .opening, .unsupported_book, .malformed_book => .opening,
+            .reading, .chapter_error => .reading,
+            .settings => .settings,
+            .chapter_browser => .chapter_browser,
+        },
+        .readiness = if (fixture_state == .chapter_error) .chapter_error else .ready,
+        .mode = if (reading_mode == .rsvp) .rsvp else .paged,
+        .buttons = .{
+            .a = pushed & pdapi.BUTTON_A != 0,
+            .b = pushed & pdapi.BUTTON_B != 0,
+            .up = pushed & pdapi.BUTTON_UP != 0,
+            .down = pushed & pdapi.BUTTON_DOWN != 0,
+            .left = pushed & pdapi.BUTTON_LEFT != 0,
+            .right = pushed & pdapi.BUTTON_RIGHT != 0,
+        },
+    });
 }
 
 fn settingsMenuSelected(userdata: ?*anyopaque) callconv(.c) void {
