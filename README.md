@@ -1,67 +1,90 @@
-# Zig Template for Playdate
+# EPUBDate
 
-## EPUBDate plan
+EPUBDate is a small, offline, text-first EPUB reader for Playdate. It reads
+ordinary unencrypted reflowable books from the Playdate data area.
 
-The current standalone product and engineering specification is in
-[spec.md](spec.md).
+Start with the [product spec](spec.md) for reader behavior and supported EPUB
+features. [The refactor roadmap](refactor.md) explains the architecture work
+that shaped the current code.
 
-The rewrite architecture, EPUB compatibility contract, and implementation
-milestones are in [plan.md](plan.md).
+## Build and run
 
-The design for replacing temporary whole-chapter buffers with a bounded
-streaming ZIP-to-page pipeline is in [streamingzip.md](streamingzip.md).
+You need Zig 0.16.0 and Playdate SDK 3.0.0 or newer. Set
+`PLAYDATE_SDK_PATH` to the SDK directory.
 
-The prioritized assessment and delivery order for the next structural
-refactor is in [refactor.md](refactor.md).
+```sh
+zig build test  # host unit and integration tests
+zig build       # make the .pdx package
+zig build run   # package and open it in the simulator
+```
 
-## Overview
-Write your [Playdate](https://play.date) game in [Zig](https://ziglang.org)!  Use this template as a starting point to write your games in Zig.  The `build.zig` will allow you to generate a Playdate `.pdx` executable that will work both in the simulator and on hardware.
+Run the host suite before changing behavior. For reader, rendering, input, or
+memory work, also smoke test in the simulator and on hardware.
 
-## Things To Be Aware Of
-- Not Everything Has Been Tested
-    - With `zig translate-c` and a bunch of customization by hand, I converted the C API of the Playdate SDK to Zig.  While I have battle tested a lot of the APIs in my upcoming Pictoblox game and in my [port of UPWARD](https://github.com/DanB91/Upward-for-Playdate), there is much of the API here that has not been tested -- especially, the Sprite, JSON, Synth, and Sound Effect APIs.  If something isn't working, please check against the headers in the Playdate SDK C API and make sure the APIs match. Please open a bug report if the APIs don't match.
+## How the reader is put together
 
-- Not Officially Supported
-    - While it works very well due to its interoperability with C, Zig is not officially supported on the Playdate.  If you are having any issues, feel free to open a bug report here.
+| Area | Owns | Change it when… |
+| --- | --- | --- |
+| Platform | Playdate API calls, file adapters, allocation, drawing | adapting a device API or rendering primitive |
+| Storage | library discovery, settings, resume records, pace, writes | changing saved data or persistence timing |
+| Archive | ZIP validation and bounded stored/DEFLATE streams | changing archive support or validation |
+| Publication | EPUB container, OPF spine, and chapter labels | changing EPUB metadata handling |
+| Content | XHTML events, page building, word extraction | changing text interpretation, pagination, or word rules |
+| Reader coordinator | screens, input intents, reader composition, bounded work order | adding reader UI behavior or a new mode |
 
-- Be Mindful Of The Stack
-    - You only get 10KB of stack space. That's it. I have not tested much of Zig's std on the Playdate, but std was not designed for a stack this small. See how far you can get, but you might want to write a lightweight "toolbox" library, like I did for UPWARD.  `std.fmt.bufPrintZ` works well, though!.
+`App` is the Playdate-facing shell. It collects buttons and crank input,
+adapts file and menu callbacks, hosts the drawing adapter, and gives the
+coordinator one bounded update each frame. Reader policy belongs in the
+coordinator and reader engines, not in `App` callbacks.
 
-##  <a name="Requirements"></a>Requirements
-- Either macOS, Windows, or Linux.
-- Zig compiler 0.16.0.
-- [Playdate SDK](https://play.date/dev/) 3.0.0 or later installed.
+## The important owners
 
-## Contents
-- `build.zig` -- Prepopulated with code that will generate the Playdate `.pdx` executable.
-- `src/playdate_api_definitions.zig` -- Contains all of the Playdate API code.  This is 1-to-1 with [Playdate's C API](https://sdk.play.date/3.0.0/Inside%20Playdate%20with%20C.html)
-- `main.zig` -- Entry point for your code!  Contains example code that draws the Zig logo and inverts the screen colors when "A" is held.
-- `panic_handler.zig` -- The default Zig panic handler will cause the simulator and hardware to crash without any error message. I wrote my own handler, so panics should now be ~~handled gracefully with proper error messages~~. **UPDATE: As of Playdate OS 3.0.0, the panic handler currently crashes on the simulator. See the 2nd TODO in panic_handler.zig for more details.**
-- `pdxinfo` -- This contains all of the metadata for your game.  Panic provides documentation for this file [here](https://sdk.play.date/3.0.0/Inside%20Playdate.html#pdxinfo).
-- `assets/` -- This folder will contain your assets and has an example image that is drawn to the screen in the example code in `main.zig`.
--  `vs-code-launch-config` -- This contains instructions and starter configuration files for running and debugging your game on Visual Studio Code.  I also made [a video](https://www.youtube.com/watch?v=PV0WbR3KiiQ) on how to do this as well.
+- `OpeningSession` owns the EPUB-opening state machine and its temporary work.
+- `PagedReader` owns the three page slots, selection, rescans, checkpoints,
+  and page navigation.
+- `RsvpReader` owns the displayed word, two neighbors, autoplay, and reverse
+  reconstruction targets.
+- `PrefetchSession` prepares one next-chapter page only after it owns the
+  shared decode lease.
+- The persistence service owns record names, validation, debounce scheduling,
+  and writes.
+- The Playdate renderer turns prepared text and geometry into graphics calls.
 
-## Cross Compilation
-Zig natively supports cross-compilation.  This is leveraged to not only generate an executable that runs on the Playdate hardware, but also to generate a PDX that works across all supported OSs regardless of what OS the game is compiled on. So, any PDX generated by this template should run on the Playdate Simulator on either macOS, Windows or Linux, and also run on Playdate hardware.
+## Rules that keep this safe
 
-_**NOTE for Intel Mac users:**_ PDXs generated by this template on Windows, Linux, and M1 Macs will only run on M1 Macs.  However, if you compile on an Intel Mac, it will generate a PDX that runs on Windows, Linux, and Intel Macs.  But it will not run on M1 Macs.  When compiling on an Intel Mac, change `FORCE_COMPILE_M1_MAC` in `build.zig` to force the template to generate that run M1 Macs instead of Intel Macs. Of crucial note: if a PDX runs on an M1 Mac, it will not run on Intel Mac, and vice versa.
+- Keep substantial reader state on the heap. The Playdate callback stack is
+  tiny; do not return or copy large reader structs during startup.
+- Decode only a bounded amount per update. Opening, page builds, rescans, and
+  prefetch must yield between steps.
+- Keep exactly three drawable page caches: previous, current, and next.
+- Do not seek inside a DEFLATE stream. Rebuild semantic positions from the
+  start of a chapter.
+- There is one reusable decode workspace. Active reading and prefetch must
+  never use it at the same time.
+- Paged and RSVP positions use the same normalized word ordinal.
+- Keep Playdate bindings in platform-facing code. Reader, archive, content,
+  publication, and storage code should stay host-testable.
 
-## Run Example Code
-1. Make sure the Playdate SDK is installed, Zig is installed and in your PATH, and all other [requirements](#Requirements) are met.
-1. Make sure the Playdate Simulator is closed.
-1. Run `zig build run`.
-    1. If there any errors, double check `PLAYDATE_SDK_PATH` is correctly set.
-1. You should now see simulator come up and look the [screenshot here](#screenshot).
-1. When you quit out to the home menu, change the home menu to view as list and you should see the "Hello Zig" program with a custom icon [like here](#home-screen-list-view).
-1. Optionally, connect your Playdate to the comupter and upload to the device by going to `Device` -> `Upload Game to Device..` in the Playdate Simulator.
-    1. It should load and run on the hardware as well!
+## Where a change belongs
 
-## Other Notes
-- You can generate a release build with either `zig build -Doptimize=ReleaseFast` or `zig build -Doptimize=ReleaseSafe` for a slightly slower build than ReleaseFast but with safety checks like array out-of-bounds checking. For a Playdate game, you probably want ship a ReleaseFast.
+For a new button rule or screen transition, start with the input policy and
+reader coordinator. For page behavior, work in `PagedReader`; for RSVP timing
+or word movement, work in `RsvpReader`. EPUB opening failures and metadata go
+through `OpeningSession`. Saved settings or positions go through the
+persistence service. Add a drawing primitive to the Playdate renderer rather
+than calling graphics APIs from a reader engine.
 
+Give every extracted module direct host tests for its contract. Keep an
+integration test when a change crosses ZIP, EPUB, XHTML, and reader layers.
 
-## <a name="Screenshot"></a>Screenshot
-<img src="readme_res/screenshot.png" alt="isolated" width="400"/>
+## Before you hand it off
 
-## <a name="ListView"></a>Home Screen List View
-<img src="readme_res/listview.png" alt="isolated" width="400"/>
+Run `zig build test` and `zig build`. For a reader-facing change, smoke test:
+
+- opening a book and browsing chapters;
+- Paged and RSVP navigation, including a mode switch;
+- returning to the library and reopening the book; and
+- the same flow on hardware.
+
+The product limits, EPUB compatibility details, and known non-features live in
+the [product spec](spec.md).

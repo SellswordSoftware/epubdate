@@ -13,4 +13,10 @@ test {
     _ = @import("storage/library.zig");
     _ = @import("storage/pace.zig");
     _ = @import("rsvp_integration.zig");
+    _ = @import("paged_reader.zig");
+    _ = @import("rsvp_reader.zig");
+    _ = @import("reader_coordinator.zig");
+    _ = @import("telemetry.zig");
+    _ = @import("decode_workspace.zig");
+    _ = @import("prefetch_session.zig");
 }

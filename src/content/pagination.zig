@@ -89,7 +89,7 @@ pub const PageCache = struct {
     }
 
     /// Returns the new selection only when it remains in this cached page.
-    /// Crossing page boundaries is intentionally a later slice.
+    /// PagedReader handles selection that crosses a page boundary.
     pub fn moveSelection(self: *const PageCache, selected: ?u32, direction: i8) ?u32 {
         if (self.word_count == 0) return null;
         const first = self.first_word_ordinal;

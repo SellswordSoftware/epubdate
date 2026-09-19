@@ -18,8 +18,15 @@ pub fn build(b: *std.Build) !void {
     // that do not need them.
     const test_roots = [_][]const u8{
         "src/app.zig",
+        "src/opening_session.zig",
         "src/reader_input.zig",
         "src/reader_transitions.zig",
+        "src/paged_reader.zig",
+        "src/rsvp_reader.zig",
+        "src/reader_coordinator.zig",
+        "src/telemetry.zig",
+        "src/decode_workspace.zig",
+        "src/prefetch_session.zig",
         "src/chapter_browser.zig",
         "src/archive/deflate.zig",
         "src/archive/zip.zig",
