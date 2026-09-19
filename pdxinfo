@@ -1,0 +1,5 @@
+name=EPUBDate
+author=Mike
+description=A text-first EPUB reader for Playdate
+bundleID=com.mike.epubdate
+imagePath=assets/images
