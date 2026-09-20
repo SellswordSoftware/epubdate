@@ -7,8 +7,10 @@ Start with the [product spec](spec.md) for reader behavior and supported EPUB
 features. [The refactor roadmap](refactor.md) explains the architecture work
 that shaped the current code. The [backward-navigation plan](backward-navigation-plan.md)
 records the fixed-memory reverse-navigation milestone.
-The [reading-progress plan](progress-feature-plan.md) defines the next
+The [reading-progress plan](progress-feature-plan.md) records the completed
 incremental milestone for exact percentages, learned pace, and progress UI.
+The [continuous-scroll plan](scroll.md) defines the next shared-cache reader
+presentation milestone.
 
 ## Build and run
 

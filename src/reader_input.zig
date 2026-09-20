@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Screen = enum { library, opening, reading, settings, chapter_browser };
+pub const Screen = enum { library, opening, reading, settings, statistics, chapter_browser };
 pub const Readiness = enum { opening, ready, chapter_error };
 pub const ReadingMode = enum { paged, rsvp };
 
@@ -27,6 +27,7 @@ pub const Intent = enum {
     open_selected_book,
     return_to_library,
     close_settings,
+    close_statistics,
     close_chapter_browser,
     chapter_browser_next,
     chapter_browser_previous,
@@ -46,6 +47,10 @@ pub const Intent = enum {
 };
 
 pub fn intentFor(snapshot: Snapshot) Intent {
+    if (snapshot.screen == .statistics) {
+        if (snapshot.buttons.b) return .close_statistics;
+        return .none;
+    }
     if (snapshot.screen == .settings) {
         if (snapshot.buttons.b) return .close_settings;
         if (snapshot.buttons.down) return .settings_next;

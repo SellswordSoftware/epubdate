@@ -29,10 +29,11 @@ pub const App = struct {
     pub fn init(playdate: *pdapi.PlaydateAPI, allocator: *PlaydateAllocator) !*App {
         const body_font = playdate.graphics.loadFont("/System/Fonts/Roobert-20-Medium.pft", null) orelse return error.FontLoadFailed;
         const newsleak_serif_font = playdate.graphics.loadFont("assets/fonts/Newsleak-Serif.pft", null) orelse return error.FontLoadFailed;
+        const asheville_sans_font = playdate.graphics.loadFont("assets/fonts/Asheville-Sans-14-Bold.pft", null) orelse return error.FontLoadFailed;
         const app = try allocator.allocator().create(App);
         app.playdate = playdate;
         app.allocator = allocator;
-        app.renderer = PlaydateRenderer.init(playdate, body_font, newsleak_serif_font);
+        app.renderer = PlaydateRenderer.init(playdate, body_font, newsleak_serif_font, asheville_sans_font);
         app.opening_file = null;
         app.chapter_file = null;
         app.prefetch_file = null;

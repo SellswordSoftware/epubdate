@@ -5,6 +5,7 @@ const library_storage = @import("storage/library.zig");
 const reading_pace = @import("storage/pace.zig");
 const reading_progress = @import("storage/progress.zig");
 const progress_indexer = @import("progress_indexer.zig");
+const reading_statistics = @import("reading_statistics.zig");
 const settings_menu = @import("settings_menu.zig");
 const paged_reader = @import("paged_reader.zig");
 const rsvp_reader = @import("rsvp_reader.zig");
@@ -53,6 +54,7 @@ pub const Screen = enum {
     opening,
     reading,
     settings,
+    statistics,
     chapter_browser,
     unsupported_book,
     malformed_book,
@@ -65,6 +67,7 @@ pub const Font = persistence.Font;
 pub const ProgressVisibility = persistence.ProgressVisibility;
 pub const ProgressPosition = persistence.ProgressPosition;
 pub const ProgressScope = persistence.ProgressScope;
+pub const ProgressView = reading_progress.View;
 pub const SettingsRow = settings_menu.Row;
 pub const Readiness = enum { opening, ready, chapter_error };
 pub const Lifecycle = enum {
@@ -407,6 +410,19 @@ pub const ReaderCoordinator = struct {
         if (self.screen != .settings) return false;
         self.clearResetHold();
         self.screen = self.screen_before_settings;
+        return true;
+    }
+
+    pub fn openStatistics(self: *ReaderCoordinator) bool {
+        if (self.screen != .settings) return false;
+        self.clearResetHold();
+        self.screen = .statistics;
+        return true;
+    }
+
+    pub fn closeStatistics(self: *ReaderCoordinator) bool {
+        if (self.screen != .statistics) return false;
+        self.screen = .settings;
         return true;
     }
 
@@ -1304,6 +1320,7 @@ pub const ReaderCoordinator = struct {
             .open_selected_book => _ = self.openSelectedBook(),
             .return_to_library => self.leaveBook(now_ms),
             .close_settings => _ = self.closeSettings(),
+            .close_statistics => _ = self.closeStatistics(),
             .close_chapter_browser => {
                 _ = self.closeChapterBrowser();
                 self.crank_accumulated = 0;
@@ -1347,7 +1364,8 @@ pub const ReaderCoordinator = struct {
                     };
                     self.saveSettings();
                 },
-                .statistics, .reset_progress => {},
+                .statistics => _ = self.openStatistics(),
+                .reset_progress => {},
             },
             .toggle_reading_mode => self.switchReadingMode(now_ms),
             .rsvp_toggle_autoplay => if (self.screen == .reading and self.mode == .rsvp) self.rsvp_reader.toggleAutoplay(now_ms, &self.pace),
@@ -1416,7 +1434,11 @@ pub const ReaderCoordinator = struct {
     }
 
     fn switchFont(self: *ReaderCoordinator) void {
-        self.font = if (self.font == .roobert) .newsleak_serif else .roobert;
+        self.font = switch (self.font) {
+            .roobert => .newsleak_serif,
+            .newsleak_serif => .asheville_sans,
+            .asheville_sans => .roobert,
+        };
         self.saveSettings();
         if (self.lifecycle != .ready or self.mode != .paged) return;
 
@@ -1600,6 +1622,16 @@ pub const ReaderCoordinator = struct {
                 .progress_scope = self.progress_scope,
                 .reset_hold_ms = self.reset_hold_elapsed_ms,
             } },
+            .statistics => {
+                const index = self.progress_worker.snapshot();
+                const chapter_count = if (index) |value| value.key.spine_len else 0;
+                return .{ .statistics = reading_statistics.format(
+                    self.progressView(),
+                    self.pace,
+                    self.progress_worker.status(),
+                    chapter_count,
+                ) };
+            },
             .chapter_browser => {
                 var rows = [_]ChapterRowView{.{}} ** chapter_browser.visible_rows;
                 const count = self.chapter_browser.displayedCount();
@@ -1645,6 +1677,9 @@ pub const ReaderCoordinator = struct {
                         .waiting = state.waiting_for_page,
                         .reconstructing = state.reconstructing,
                         .progress = self.progressView(),
+                        .progress_visibility = self.progress_visibility,
+                        .progress_position = self.progress_position,
+                        .progress_scope = self.progress_scope,
                     } };
                 },
                 .rsvp => blk: {
@@ -1658,6 +1693,9 @@ pub const ReaderCoordinator = struct {
                         .playing = state.playing,
                         .wpm = state.wpm,
                         .progress = self.progressView(),
+                        .progress_visibility = self.progress_visibility,
+                        .progress_position = self.progress_position,
+                        .progress_scope = self.progress_scope,
                     } };
                 },
             },
@@ -1754,6 +1792,7 @@ pub fn intentFor(snapshot: InputSnapshot) input.Intent {
             .opening, .unsupported_book, .malformed_book => .opening,
             .reading, .chapter_error => .reading,
             .settings => .settings,
+            .statistics => .statistics,
             .chapter_browser => .chapter_browser,
         },
         .readiness = switch (snapshot.readiness) {
@@ -1831,6 +1870,9 @@ pub const PagedView = struct {
     waiting: bool,
     reconstructing: bool,
     progress: ?reading_progress.View = null,
+    progress_visibility: ProgressVisibility = .off,
+    progress_position: ProgressPosition = .top,
+    progress_scope: ProgressScope = .chapter,
 };
 
 pub const ByteSpan = struct { start: usize, end: usize };
@@ -1843,6 +1885,9 @@ pub const RsvpView = struct {
     playing: bool,
     wpm: u16,
     progress: ?reading_progress.View = null,
+    progress_visibility: ProgressVisibility = .off,
+    progress_position: ProgressPosition = .top,
+    progress_scope: ProgressScope = .chapter,
 };
 
 pub const ChapterErrorView = struct {
@@ -1856,9 +1901,12 @@ pub const RenderModel = union(enum) {
     paged: PagedView,
     rsvp: RsvpView,
     settings: SettingsView,
+    statistics: StatisticsView,
     chapters: ChaptersView,
     failure: ErrorView,
 };
+
+pub const StatisticsView = reading_statistics.View;
 
 pub const SettingsView = struct {
     selected: SettingsRow,
@@ -2385,6 +2433,33 @@ test "scrolling settings keeps every selection visible and reset hold uninterrup
     try std.testing.expectEqual(Screen.settings, coordinator.screen);
     coordinator.updateResetHold(true, false, 5_100);
     try std.testing.expectEqual(Screen.library, coordinator.screen);
+}
+
+test "statistics is a non-blocking settings child and B returns to its row" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.beginReading();
+    try std.testing.expect(coordinator.openSettings());
+    for (0..@intFromEnum(SettingsRow.statistics)) |_| coordinator.moveSettingsSelection(1);
+    try std.testing.expectEqual(SettingsRow.statistics, coordinator.settings_menu_state.selected);
+
+    const before = coordinator.progress_worker.status();
+    coordinator.performIntent(.activate_setting, 0);
+    try std.testing.expectEqual(Screen.statistics, coordinator.screen);
+    try std.testing.expect(std.meta.eql(before, coordinator.progress_worker.status()));
+    switch (coordinator.renderModel()) {
+        .statistics => |view| try std.testing.expectEqualStrings("Index: unavailable", view.index.slice()),
+        else => return error.TestUnexpectedResult,
+    }
+
+    coordinator.performIntent(intentFor(.{
+        .screen = coordinator.screen,
+        .readiness = .ready,
+        .mode = coordinator.mode,
+        .buttons = .{ .b = true },
+    }), 1);
+    try std.testing.expectEqual(Screen.settings, coordinator.screen);
+    try std.testing.expectEqual(SettingsRow.statistics, coordinator.settings_menu_state.selected);
 }
 
 test "coordinator retains bounded library and chapter-browser navigation state" {

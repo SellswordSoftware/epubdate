@@ -2,8 +2,15 @@ const std = @import("std");
 
 pub const screen_width: usize = 400;
 pub const screen_height: usize = 240;
+/// Reader content always leaves these lanes free, even while progress is off,
+/// so changing visibility or placement never changes pagination.
+pub const reserved_edge_rows: usize = 4;
+pub const top_rail_edge_y: usize = 0;
+pub const top_rail_inner_y: usize = 2;
+pub const bottom_rail_edge_y: usize = screen_height - 1;
+pub const bottom_rail_inner_y: usize = screen_height - 3;
 pub const text_x: usize = 8;
-pub const text_y: usize = 4;
+pub const text_y: usize = reserved_edge_rows;
 pub const text_width: usize = screen_width - (text_x * 2);
 pub const minimum_line_gap: usize = 1;
 pub const highlight_padding_x: usize = 1;
@@ -30,7 +37,7 @@ pub fn lineAdvance(font_height: usize) usize {
 }
 
 pub fn pageLineLimit(font_height: usize, storage_capacity: usize) u8 {
-    const available_height = screen_height - text_y;
+    const available_height = screen_height - text_y - reserved_edge_rows;
     const fitting_lines = (available_height + minimum_line_gap) / lineAdvance(font_height);
     return @intCast(@max(@as(usize, 1), @min(fitting_lines, storage_capacity)));
 }

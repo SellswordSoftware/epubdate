@@ -26,6 +26,8 @@ pub fn build(b: *std.Build) !void {
         "src/reader_coordinator.zig",
         "src/telemetry.zig",
         "src/settings_menu.zig",
+        "src/reading_statistics.zig",
+        "src/progress_rail.zig",
         "src/decode_workspace.zig",
         "src/prefetch_session.zig",
         "src/progress_indexer.zig",

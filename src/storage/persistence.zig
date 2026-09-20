@@ -243,6 +243,13 @@ test "settings persist independently of per-book records" {
     try std.testing.expectEqual(Settings{ .reading_mode = .rsvp, .rsvp_wpm = 425, .theme = .dark, .font = .newsleak_serif }, service.loadSettings());
 }
 
+test "the Asheville font round trips through the settings record" {
+    var files = MemoryFiles{};
+    var service = Service.init(files.port());
+    try std.testing.expect(service.saveSettings(.{ .reading_mode = .paged, .rsvp_wpm = 300, .theme = .light, .font = .asheville_sans }));
+    try std.testing.expectEqual(Settings{ .reading_mode = .paged, .rsvp_wpm = 300, .theme = .light, .font = .asheville_sans }, service.loadSettings());
+}
+
 test "progress indexes persist by book identity and retry failed writes" {
     var files = MemoryFiles{};
     var service = Service.init(files.port());

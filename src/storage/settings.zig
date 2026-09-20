@@ -23,6 +23,7 @@ pub const Theme = enum(u8) {
 pub const Font = enum(u8) {
     roobert = 0,
     newsleak_serif = 1,
+    asheville_sans = 2,
 };
 
 pub const ProgressVisibility = enum(u8) { off = 0, on = 1 };
@@ -42,18 +43,21 @@ pub const Settings = struct {
 pub const Error = error{InvalidRecord};
 
 pub fn encode(settings: Settings, output: *[encoded_size]u8) void {
+    // Version six widens the font field from one bit to two so the Asheville
+    // font fits beside Roobert and Newsleak; older versions stay decodable.
     const display: u8 = @intFromEnum(settings.theme) |
         (@intFromEnum(settings.font) << 1) |
-        (@intFromEnum(settings.progress_visibility) << 2) |
-        (@intFromEnum(settings.progress_position) << 3) |
-        (@intFromEnum(settings.progress_scope) << 4);
-    output.* = .{ 'E', 'P', 'S', 5, @intFromEnum(settings.reading_mode), 0, 0, display };
+        (@intFromEnum(settings.progress_visibility) << 3) |
+        (@intFromEnum(settings.progress_position) << 4) |
+        (@intFromEnum(settings.progress_scope) << 5);
+    output.* = .{ 'E', 'P', 'S', 6, @intFromEnum(settings.reading_mode), 0, 0, display };
     std.mem.writeInt(u16, output[5..7], clampWpm(settings.rsvp_wpm), .little);
 }
 
 pub fn decode(input: *const [encoded_size]u8) Error!Settings {
     if (!std.mem.eql(u8, input[0..3], "EPS")) return error.InvalidRecord;
     if (input[3] == 5 and input[7] & 0xc0 != 0) return error.InvalidRecord;
+    if (input[3] == 6 and input[7] & 0x80 != 0) return error.InvalidRecord;
     const reading_mode: ReadingMode = switch (input[4]) {
         @intFromEnum(ReadingMode.paged) => .paged,
         @intFromEnum(ReadingMode.rsvp) => .rsvp,
@@ -93,6 +97,25 @@ pub fn decode(input: *const [encoded_size]u8) Error!Settings {
             .progress_visibility = if ((input[7] >> 2) & 0x1 == 0) .off else .on,
             .progress_position = if ((input[7] >> 3) & 0x1 == 0) .top else .bottom,
             .progress_scope = switch ((input[7] >> 4) & 0x3) {
+                0 => .chapter,
+                1 => .book,
+                2 => .both,
+                else => return error.InvalidRecord,
+            },
+        },
+        6 => .{
+            .reading_mode = reading_mode,
+            .rsvp_wpm = validateWpm(std.mem.readInt(u16, input[5..7], .little)) orelse return error.InvalidRecord,
+            .theme = if (input[7] & 0x1 == 0) .light else .dark,
+            .font = switch ((input[7] >> 1) & 0x3) {
+                @intFromEnum(Font.roobert) => .roobert,
+                @intFromEnum(Font.newsleak_serif) => .newsleak_serif,
+                @intFromEnum(Font.asheville_sans) => .asheville_sans,
+                else => return error.InvalidRecord,
+            },
+            .progress_visibility = if ((input[7] >> 3) & 0x1 == 0) .off else .on,
+            .progress_position = if ((input[7] >> 4) & 0x1 == 0) .top else .bottom,
+            .progress_scope = switch ((input[7] >> 5) & 0x3) {
                 0 => .chapter,
                 1 => .book,
                 2 => .both,
@@ -157,6 +180,38 @@ test "migrates theme records to the Roobert font" {
     try std.testing.expectEqual(Font.roobert, settings.font);
 }
 
+test "round trips the Asheville font at the current record version" {
+    var bytes: [encoded_size]u8 = undefined;
+    encode(.{
+        .reading_mode = .paged,
+        .rsvp_wpm = 350,
+        .theme = .dark,
+        .font = .asheville_sans,
+        .progress_visibility = .on,
+        .progress_position = .bottom,
+        .progress_scope = .book,
+    }, &bytes);
+    const settings = try decode(&bytes);
+    try std.testing.expectEqual(ReadingMode.paged, settings.reading_mode);
+    try std.testing.expectEqual(@as(u16, 350), settings.rsvp_wpm);
+    try std.testing.expectEqual(Theme.dark, settings.theme);
+    try std.testing.expectEqual(Font.asheville_sans, settings.font);
+    try std.testing.expectEqual(ProgressVisibility.on, settings.progress_visibility);
+    try std.testing.expectEqual(ProgressPosition.bottom, settings.progress_position);
+    try std.testing.expectEqual(ProgressScope.book, settings.progress_scope);
+}
+
+test "migrates version five records to the wider font field" {
+    var bytes = [_]u8{ 'E', 'P', 'S', 5, @intFromEnum(ReadingMode.paged), 0, 0, @intFromEnum(Theme.dark) | (@intFromEnum(Font.newsleak_serif) << 1) | (@intFromEnum(ProgressVisibility.on) << 2) | (@intFromEnum(ProgressScope.book) << 4) };
+    std.mem.writeInt(u16, bytes[5..7], 425, .little);
+    const settings = try decode(&bytes);
+    try std.testing.expectEqual(Theme.dark, settings.theme);
+    try std.testing.expectEqual(Font.newsleak_serif, settings.font);
+    try std.testing.expectEqual(ProgressVisibility.on, settings.progress_visibility);
+    try std.testing.expectEqual(ProgressPosition.top, settings.progress_position);
+    try std.testing.expectEqual(ProgressScope.book, settings.progress_scope);
+}
+
 test "migrates version four records to default progress display settings" {
     var bytes = [_]u8{ 'E', 'P', 'S', 4, @intFromEnum(ReadingMode.paged), 0, 0, @intFromEnum(Theme.dark) | (@intFromEnum(Font.newsleak_serif) << 1) };
     std.mem.writeInt(u16, bytes[5..7], 425, .little);
@@ -182,6 +237,11 @@ test "rejects unknown settings versions and modes" {
     try std.testing.expectError(error.InvalidRecord, decode(&bytes));
     bytes[3] = 5;
     bytes[7] = 0x30;
+    try std.testing.expectError(error.InvalidRecord, decode(&bytes));
+    bytes[3] = 6;
+    bytes[7] = 0x80;
+    try std.testing.expectError(error.InvalidRecord, decode(&bytes));
+    bytes[7] = 0x6;
     try std.testing.expectError(error.InvalidRecord, decode(&bytes));
 }
 

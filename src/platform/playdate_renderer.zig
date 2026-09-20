@@ -4,6 +4,7 @@ const pdapi = @import("../playdate_api_definitions.zig");
 const AllocatorStats = @import("playdate_allocator.zig").Stats;
 const reader_coordinator = @import("../reader_coordinator.zig");
 const reader_layout = @import("../reader_layout.zig");
+const progress_rail = @import("../progress_rail.zig");
 const TelemetrySnapshot = @import("../telemetry.zig").Telemetry.Snapshot;
 
 /// The only layer that translates reader drawing primitives into Playdate
@@ -12,14 +13,16 @@ pub const Renderer = struct {
     playdate: *pdapi.PlaydateAPI,
     roobert_font: *pdapi.LCDFont,
     newsleak_serif_font: *pdapi.LCDFont,
+    asheville_sans_font: *pdapi.LCDFont,
     body_font: *pdapi.LCDFont,
     theme: reader_coordinator.Theme,
 
-    pub fn init(playdate: *pdapi.PlaydateAPI, roobert_font: *pdapi.LCDFont, newsleak_serif_font: *pdapi.LCDFont) Renderer {
+    pub fn init(playdate: *pdapi.PlaydateAPI, roobert_font: *pdapi.LCDFont, newsleak_serif_font: *pdapi.LCDFont, asheville_sans_font: *pdapi.LCDFont) Renderer {
         return .{
             .playdate = playdate,
             .roobert_font = roobert_font,
             .newsleak_serif_font = newsleak_serif_font,
+            .asheville_sans_font = asheville_sans_font,
             .body_font = roobert_font,
             .theme = .light,
         };
@@ -38,6 +41,7 @@ pub const Renderer = struct {
         self.body_font = switch (font) {
             .roobert => self.roobert_font,
             .newsleak_serif => self.newsleak_serif_font,
+            .asheville_sans => self.asheville_sans_font,
         };
     }
 
@@ -45,6 +49,7 @@ pub const Renderer = struct {
         switch (model) {
             .library => |view| self.drawLibrary(view),
             .settings => |view| self.drawSettings(view),
+            .statistics => |view| self.drawStatistics(view),
             .chapters => |view| self.drawChapters(view),
             .opening => self.text("Opening EPUB...", 12, 12),
             .paged => |view| self.drawPage(view),
@@ -146,7 +151,11 @@ pub const Renderer = struct {
                 .reading_mode => if (view.mode == .rsvp) "RSVP" else "Paged",
                 .rsvp_wpm => std.fmt.bufPrint(&buffer, "{d}", .{view.wpm}) catch "",
                 .theme => if (view.theme == .dark) "Dark" else "Light",
-                .font => if (view.font == .newsleak_serif) "Newsleak Serif" else "Roobert",
+                .font => switch (view.font) {
+                    .roobert => "Roobert",
+                    .newsleak_serif => "Newsleak Serif",
+                    .asheville_sans => "Asheville Sans",
+                },
                 .progress_visibility => if (view.progress_visibility == .on) "On" else "Off",
                 .progress_position => if (view.progress_position == .bottom) "Bottom" else "Top",
                 .progress_scope => switch (view.progress_scope) {
@@ -171,6 +180,23 @@ pub const Renderer = struct {
         self.text(if (view.selected == .reset_progress) "Hold A: reset   B: back" else "A: change   B: back", 12, 216);
     }
 
+    fn drawStatistics(self: *Renderer, view: reader_coordinator.StatisticsView) void {
+        self.text("Reading statistics", 12, 12);
+        const lines = [_][]const u8{
+            view.chapter_progress.slice(),
+            view.chapter_eta.slice(),
+            view.book_progress.slice(),
+            view.book_eta.slice(),
+            view.pace.slice(),
+            view.index.slice(),
+        };
+        const row_advance = @max(reader_layout.lineAdvance(self.fontHeight()), 25);
+        for (lines, 0..) |line, index| {
+            self.text(line, 12, @intCast(38 + index * row_advance));
+        }
+        self.text("B: back", 12, 216);
+    }
+
     fn drawChapters(self: *Renderer, view: reader_coordinator.ChaptersView) void {
         var header_buffer: [32]u8 = undefined;
         const header = std.fmt.bufPrint(&header_buffer, "Chapters {d}/{d}", .{ view.selected + 1, view.entries }) catch "Chapters";
@@ -185,6 +211,7 @@ pub const Renderer = struct {
     }
 
     fn drawPage(self: *Renderer, view: reader_coordinator.PagedView) void {
+        self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
         if (view.line_count == 0) {
             self.text(if (view.reconstructing) "Restoring position..." else "Loading chapter...", 12, 12);
             return;
@@ -205,6 +232,7 @@ pub const Renderer = struct {
     }
 
     fn drawRsvp(self: *Renderer, view: reader_coordinator.RsvpView) void {
+        self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
         self.text(if (view.playing) "RSVP - playing" else "RSVP - paused", 12, 12);
         var buffer: [16]u8 = undefined;
         self.text(std.fmt.bufPrint(&buffer, "WPM: {d}", .{view.wpm}) catch "", 12, 36);
@@ -223,8 +251,25 @@ pub const Renderer = struct {
             const x = @as(c_int, @intCast(reader_layout.rsvp_anchor_x)) - prefix_width - @divTrunc(anchor_width, 2);
             self.text(word, x, @intCast(geometry.word_y));
         } else self.text(word, @intCast(reader_layout.text_x), @intCast(geometry.word_y));
-        self.text("A: play  Up/Down: WPM", 12, 196);
-        self.text("Left: sentence  B: Paged", 12, 220);
+        self.text("A: play  Up/Down: WPM", 12, 192);
+        self.text("Left: sentence  B: Paged", 12, 216);
+    }
+
+    fn drawProgressRails(
+        self: *Renderer,
+        metrics: ?reader_coordinator.ProgressView,
+        visibility: reader_coordinator.ProgressVisibility,
+        position: reader_coordinator.ProgressPosition,
+        scope: reader_coordinator.ProgressScope,
+    ) void {
+        const rails = progress_rail.layout(metrics, visibility, position, scope);
+        if (rails.chapter) |rail| self.drawProgressRail(rail);
+        if (rails.book) |rail| self.drawProgressRail(rail);
+    }
+
+    fn drawProgressRail(self: *Renderer, rail: progress_rail.Rail) void {
+        if (rail.width == 0) return;
+        self.playdate.graphics.fillRect(0, rail.y, rail.width, 1, solidColor(self.foregroundColor()));
     }
 
     fn rule(self: *Renderer, x1: usize, y1: usize, x2: usize, y2: usize) void {
