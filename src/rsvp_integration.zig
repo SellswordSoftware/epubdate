@@ -135,7 +135,7 @@ test "Paged selection and RSVP hand-offs retain the same normalized word" {
 }
 
 test "RSVP fixture anchor and elapsed autoplay hold across 100, 300, and 1000 WPM" {
-    try std.testing.expectEqual(@as(u8, 2), rsvp.anchorIndex("word"));
+    try std.testing.expectEqual(@as(u8, 1), rsvp.anchorIndex("word"));
     for ([_]u16{ 100, 300, 1_000 }) |wpm| {
         var timer = rsvp.Timer{};
         timer.start(10_000);

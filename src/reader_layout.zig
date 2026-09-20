@@ -7,12 +7,22 @@ pub const text_y: usize = 4;
 pub const text_width: usize = screen_width - (text_x * 2);
 pub const minimum_line_gap: usize = 1;
 pub const highlight_padding_x: usize = 1;
+/// Slightly left of center so the longer post-ORP suffix has more room.
+pub const rsvp_anchor_x: usize = 180;
 
 pub const HighlightRect = struct {
     x: usize,
     y: usize,
     width: usize,
     height: usize,
+};
+
+pub const RsvpGeometry = struct {
+    word_y: usize,
+    guide_top_y: usize,
+    guide_bottom_y: usize,
+    top_tick_start_y: usize,
+    bottom_tick_end_y: usize,
 };
 
 pub fn lineAdvance(font_height: usize) usize {
@@ -38,7 +48,32 @@ pub fn highlightRect(word_x: usize, line_y: usize, word_width: usize, font_heigh
     };
 }
 
+pub fn rsvpGeometry(font_height_value: usize) RsvpGeometry {
+    const font_height = @max(font_height_value, 1);
+    const word_y = (screen_height -| font_height) / 2;
+    const clearance = @max(@as(usize, 2), font_height / 4);
+    const tick_length = @max(@as(usize, 4), font_height / 2);
+    const guide_top_y = word_y -| clearance;
+    const guide_bottom_y = @min(screen_height - 1, word_y +| font_height +| clearance);
+    return .{
+        .word_y = word_y,
+        .guide_top_y = guide_top_y,
+        .guide_bottom_y = guide_bottom_y,
+        .top_tick_start_y = guide_top_y -| tick_length,
+        .bottom_tick_end_y = @min(screen_height - 1, guide_bottom_y +| tick_length),
+    };
+}
+
 test "font metrics leave a clear pixel between reader lines" {
     try std.testing.expectEqual(@as(usize, 21), lineAdvance(20));
     try std.testing.expectEqual(@as(u8, 11), pageLineLimit(20, 11));
+}
+
+test "RSVP guides derive clearance and ticks from the font cell" {
+    const geometry = rsvpGeometry(20);
+    try std.testing.expectEqual(@as(usize, 110), geometry.word_y);
+    try std.testing.expectEqual(@as(usize, 105), geometry.guide_top_y);
+    try std.testing.expectEqual(@as(usize, 135), geometry.guide_bottom_y);
+    try std.testing.expectEqual(@as(usize, 95), geometry.top_tick_start_y);
+    try std.testing.expectEqual(@as(usize, 145), geometry.bottom_tick_end_y);
 }

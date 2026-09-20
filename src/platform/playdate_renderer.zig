@@ -10,15 +10,35 @@ const TelemetrySnapshot = @import("../telemetry.zig").Telemetry.Snapshot;
 /// graphics calls. Higher layers provide already-selected text and geometry.
 pub const Renderer = struct {
     playdate: *pdapi.PlaydateAPI,
+    roobert_font: *pdapi.LCDFont,
+    newsleak_serif_font: *pdapi.LCDFont,
     body_font: *pdapi.LCDFont,
+    theme: reader_coordinator.Theme,
 
-    pub fn init(playdate: *pdapi.PlaydateAPI, body_font: *pdapi.LCDFont) Renderer {
-        return .{ .playdate = playdate, .body_font = body_font };
+    pub fn init(playdate: *pdapi.PlaydateAPI, roobert_font: *pdapi.LCDFont, newsleak_serif_font: *pdapi.LCDFont) Renderer {
+        return .{
+            .playdate = playdate,
+            .roobert_font = roobert_font,
+            .newsleak_serif_font = newsleak_serif_font,
+            .body_font = roobert_font,
+            .theme = .light,
+        };
     }
 
-    pub fn beginFrame(self: *Renderer) void {
+    pub fn beginFrame(self: *Renderer, theme: reader_coordinator.Theme, font: reader_coordinator.Font) void {
+        self.theme = theme;
+        self.selectFont(font);
         self.playdate.graphics.setFont(self.body_font);
-        self.playdate.graphics.clear(@intCast(@intFromEnum(pdapi.LCDSolidColor.ColorWhite)));
+        self.playdate.graphics.setBackgroundColor(self.backgroundColor());
+        self.playdate.graphics.setDrawMode(self.textDrawMode());
+        self.playdate.graphics.clear(solidColor(self.backgroundColor()));
+    }
+
+    pub fn selectFont(self: *Renderer, font: reader_coordinator.Font) void {
+        self.body_font = switch (font) {
+            .roobert => self.roobert_font,
+            .newsleak_serif => self.newsleak_serif_font,
+        };
     }
 
     pub fn draw(self: *Renderer, model: reader_coordinator.RenderModel) void {
@@ -68,10 +88,25 @@ pub const Renderer = struct {
     }
 
     pub fn invertedText(self: *Renderer, value: []const u8, text_x: c_int, text_y: c_int, rect_x: c_int, rect_y: c_int, width: c_int, height: c_int) void {
-        self.playdate.graphics.fillRect(rect_x, rect_y, width, height, @intCast(@intFromEnum(pdapi.LCDSolidColor.ColorBlack)));
-        self.playdate.graphics.setDrawMode(.DrawModeInverted);
+        self.playdate.graphics.fillRect(rect_x, rect_y, width, height, solidColor(self.foregroundColor()));
+        self.playdate.graphics.setDrawMode(switch (self.theme) {
+            .light => .DrawModeInverted,
+            .dark => .DrawModeCopy,
+        });
         self.text(value, text_x, text_y);
-        self.playdate.graphics.setDrawMode(.DrawModeCopy);
+        self.playdate.graphics.setDrawMode(self.textDrawMode());
+    }
+
+    fn backgroundColor(self: *const Renderer) pdapi.LCDSolidColor {
+        return if (self.theme == .dark) .ColorBlack else .ColorWhite;
+    }
+
+    fn foregroundColor(self: *const Renderer) pdapi.LCDSolidColor {
+        return if (self.theme == .dark) .ColorWhite else .ColorBlack;
+    }
+
+    fn textDrawMode(self: *const Renderer) pdapi.LCDBitmapDrawMode {
+        return if (self.theme == .dark) .DrawModeInverted else .DrawModeCopy;
     }
 
     fn drawLibrary(self: *Renderer, view: reader_coordinator.LibraryView) void {
@@ -88,17 +123,52 @@ pub const Renderer = struct {
         self.text("A: open", 12, 220);
     }
 
-    fn drawSettings(self: *Renderer, view: anytype) void {
+    fn drawSettings(self: *Renderer, view: reader_coordinator.SettingsView) void {
         self.text("Settings", 12, 12);
-        self.text(if (view.selected == 0) "> Reading mode" else "  Reading mode", 12, 52);
-        self.text(switch (view.mode) {
-            .paged => "Paged",
-            .rsvp => "RSVP",
-        }, 32, 76);
-        self.text(if (view.selected == 1) "> RSVP WPM" else "  RSVP WPM", 12, 112);
         var buffer: [8]u8 = undefined;
-        self.text(std.fmt.bufPrint(&buffer, "{d}", .{view.wpm}) catch "", 32, 136);
-        self.text("A: change   B: back", 12, 220);
+        const row_advance = @max(reader_layout.lineAdvance(self.fontHeight()), 24);
+        for (0..view.row_count) |visible_index| {
+            const row: reader_coordinator.SettingsRow = @enumFromInt(view.first_visible + @as(u4, @intCast(visible_index)));
+            const y: c_int = @intCast(36 + visible_index * row_advance);
+            self.text(if (row == view.selected) ">" else " ", 6, y);
+            self.text(switch (row) {
+                .reading_mode => "Reading mode",
+                .rsvp_wpm => "RSVP WPM",
+                .theme => "Theme",
+                .font => "Font",
+                .progress_visibility => "Progress bar",
+                .progress_position => "Progress position",
+                .progress_scope => "Progress scope",
+                .statistics => "Reading statistics",
+                .reset_progress => "Reset progress",
+            }, 24, y);
+            const value: []const u8 = switch (row) {
+                .reading_mode => if (view.mode == .rsvp) "RSVP" else "Paged",
+                .rsvp_wpm => std.fmt.bufPrint(&buffer, "{d}", .{view.wpm}) catch "",
+                .theme => if (view.theme == .dark) "Dark" else "Light",
+                .font => if (view.font == .newsleak_serif) "Newsleak Serif" else "Roobert",
+                .progress_visibility => if (view.progress_visibility == .on) "On" else "Off",
+                .progress_position => if (view.progress_position == .bottom) "Bottom" else "Top",
+                .progress_scope => switch (view.progress_scope) {
+                    .chapter => "Chapter",
+                    .book => "Book",
+                    .both => "Both",
+                },
+                .statistics => "",
+                .reset_progress => "Hold A 3s",
+            };
+            self.text(value, 250, y);
+        }
+
+        if (view.selected == .reset_progress and view.reset_hold_ms != 0) {
+            const bar_x: c_int = 12;
+            const bar_y: c_int = 191;
+            const bar_width: c_int = 376;
+            self.playdate.graphics.drawRect(bar_x, bar_y, bar_width, 7, solidColor(self.foregroundColor()));
+            const progress: c_int = @intCast((@as(u32, view.reset_hold_ms) * @as(u32, @intCast(bar_width - 2))) / reader_coordinator.reset_hold_duration_ms);
+            if (progress > 0) self.playdate.graphics.fillRect(bar_x + 1, bar_y + 1, progress, 5, solidColor(self.foregroundColor()));
+        }
+        self.text(if (view.selected == .reset_progress) "Hold A: reset   B: back" else "A: change   B: back", 12, 216);
     }
 
     fn drawChapters(self: *Renderer, view: reader_coordinator.ChaptersView) void {
@@ -116,7 +186,7 @@ pub const Renderer = struct {
 
     fn drawPage(self: *Renderer, view: reader_coordinator.PagedView) void {
         if (view.line_count == 0) {
-            self.text("Loading chapter...", 12, 12);
+            self.text(if (view.reconstructing) "Restoring position..." else "Loading chapter...", 12, 12);
             return;
         }
         const font_height = self.fontHeight();
@@ -142,13 +212,23 @@ pub const Renderer = struct {
             self.text(if (view.reconstructing) "Rebuilding word..." else "Loading chapter...", 12, 76);
             return;
         };
+        const geometry = reader_layout.rsvpGeometry(self.fontHeight());
+        self.rule(0, geometry.guide_top_y, reader_layout.screen_width - 1, geometry.guide_top_y);
+        self.rule(0, geometry.guide_bottom_y, reader_layout.screen_width - 1, geometry.guide_bottom_y);
+        self.rule(reader_layout.rsvp_anchor_x, geometry.top_tick_start_y, reader_layout.rsvp_anchor_x, geometry.guide_top_y);
+        self.rule(reader_layout.rsvp_anchor_x, geometry.guide_bottom_y, reader_layout.rsvp_anchor_x, geometry.bottom_tick_end_y);
         if (view.anchor) |anchor| {
             const prefix_width = self.textWidth(word[0..anchor.start]);
-            const anchor_width = self.textWidth(word[anchor.start..anchor.end]);
-            self.text(word, 200 - prefix_width - @divTrunc(anchor_width, 2), 100);
-        } else self.text(word, 12, 100);
+            const anchor_width = self.textWidth(word[0..anchor.end]) - prefix_width;
+            const x = @as(c_int, @intCast(reader_layout.rsvp_anchor_x)) - prefix_width - @divTrunc(anchor_width, 2);
+            self.text(word, x, @intCast(geometry.word_y));
+        } else self.text(word, @intCast(reader_layout.text_x), @intCast(geometry.word_y));
         self.text("A: play  Up/Down: WPM", 12, 196);
         self.text("Left: sentence  B: Paged", 12, 220);
+    }
+
+    fn rule(self: *Renderer, x1: usize, y1: usize, x2: usize, y2: usize) void {
+        self.playdate.graphics.drawLine(@intCast(x1), @intCast(y1), @intCast(x2), @intCast(y2), 1, solidColor(self.foregroundColor()));
     }
 
     fn drawFailure(self: *Renderer, view: reader_coordinator.ErrorView) void {
@@ -172,3 +252,7 @@ pub const Renderer = struct {
         }
     }
 };
+
+fn solidColor(color: pdapi.LCDSolidColor) pdapi.LCDColor {
+    return @intCast(@intFromEnum(color));
+}

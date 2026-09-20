@@ -113,6 +113,10 @@ pub const RsvpReader = struct {
         self.chapter_end = true;
     }
 
+    pub fn wordCount(self: *const RsvpReader) u32 {
+        return if (self.cursor) |cursor| cursor.wordCount() else 0;
+    }
+
     pub fn renderState(self: *const RsvpReader) RenderState {
         const current = self.drawableSlot();
         return .{

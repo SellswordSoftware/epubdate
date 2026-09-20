@@ -100,6 +100,10 @@ pub const Cursor = struct {
         try self.finishWord();
     }
 
+    pub fn wordCount(self: *const Cursor) u32 {
+        return self.word_ordinals.count();
+    }
+
     fn text(self: *Cursor, bytes: []const u8) !void {
         for (bytes) |byte| {
             if (word_index.isBoundary(byte)) {
@@ -127,7 +131,7 @@ pub const Cursor = struct {
 /// a valid UTF-8 word remains visually stable even with a future Unicode font.
 pub fn anchorIndex(word: []const u8) u8 {
     const letters = letterCount(word);
-    return if (letters <= 3) 1 else if (letters <= 5) 2 else if (letters <= 9) 3 else if (letters <= 13) 4 else 5;
+    return if (letters <= 1) 0 else (letters - 1) / 3;
 }
 
 /// Byte span of the selected anchor glyph. This keeps the renderer from
@@ -140,8 +144,8 @@ pub fn anchorBytes(word: []const u8) ?struct { start: usize, end: usize } {
         const length = utf8SequenceLength(word[index]);
         const end = @min(word.len, index + length);
         if (isLetter(word[index..end])) {
-            seen += 1;
             if (seen == wanted) return .{ .start = index, .end = end };
+            seen += 1;
         }
         index = end;
     }
@@ -246,18 +250,20 @@ test "XHTML split at every byte reaches the same bounded word cursor" {
     try std.testing.expectEqualStrings("next.", collected.word(2));
 }
 
-test "anchor bands count letters and return complete UTF-8 glyph spans" {
+test "ORP formula counts letters and returns complete UTF-8 glyph spans" {
     const cases = [_]struct { word: []const u8, anchor: u8 }{
-        .{ .word = "a", .anchor = 1 },
-        .{ .word = "four", .anchor = 2 },
-        .{ .word = "sixsix", .anchor = 3 },
-        .{ .word = "tenletters", .anchor = 4 },
-        .{ .word = "fourteenletters", .anchor = 5 },
-        .{ .word = "\xc3\xa9clair", .anchor = 3 },
+        .{ .word = "a", .anchor = 0 },
+        .{ .word = "four", .anchor = 1 },
+        .{ .word = "sixsix", .anchor = 1 },
+        .{ .word = "tenletters", .anchor = 3 },
+        .{ .word = "fourteenletters", .anchor = 4 },
+        .{ .word = "\xc3\xa9clair", .anchor = 1 },
     };
     for (cases) |case| try std.testing.expectEqual(case.anchor, anchorIndex(case.word));
     const span = anchorBytes("\xc3\xa9clair").?;
-    try std.testing.expectEqualStrings("l", "\xc3\xa9clair"[span.start..span.end]);
+    try std.testing.expectEqualStrings("c", "\xc3\xa9clair"[span.start..span.end]);
+    const punctuated = anchorBytes("(word)").?;
+    try std.testing.expectEqualStrings("o", "(word)"[punctuated.start..punctuated.end]);
 }
 
 test "WPM settings clamp, step, and validate their configured bounds" {

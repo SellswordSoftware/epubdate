@@ -18,6 +18,10 @@ pub const Counter = struct {
         if (self.next != std.math.maxInt(u32)) self.next += 1;
         return ordinal;
     }
+
+    pub fn count(self: Counter) u32 {
+        return self.next;
+    }
 };
 
 test "word boundaries are whitespace-only after XHTML normalization" {

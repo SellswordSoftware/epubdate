@@ -3,6 +3,9 @@ const input = @import("reader_input.zig");
 const chapter_browser = @import("chapter_browser.zig");
 const library_storage = @import("storage/library.zig");
 const reading_pace = @import("storage/pace.zig");
+const reading_progress = @import("storage/progress.zig");
+const progress_indexer = @import("progress_indexer.zig");
+const settings_menu = @import("settings_menu.zig");
 const paged_reader = @import("paged_reader.zig");
 const rsvp_reader = @import("rsvp_reader.zig");
 const pagination = @import("content/pagination.zig");
@@ -24,7 +27,10 @@ const prefetch_directory_records_per_step: usize = 8;
 const layout_revision: u16 = 1;
 const resume_debounce_frames: u8 = 60;
 const pace_debounce_frames: u8 = 60;
+const progress_debounce_frames: u8 = 60;
+const word_semantics_revision: u16 = 1;
 const crank_degrees_per_word: f32 = 15;
+pub const reset_hold_duration_ms: u16 = 3000;
 pub const default_checkpoint_byte_budget = cache_policy.capacity * @sizeOf(cache_policy.Entry);
 pub const page_pool_reserved_bytes = paged_reader.PagedReader.page_pool_reserved_bytes;
 pub const word_pool_reserved_bytes = rsvp_reader.RsvpReader.word_pool_reserved_bytes;
@@ -54,6 +60,12 @@ pub const Screen = enum {
 };
 
 pub const ReadingMode = enum { paged, rsvp };
+pub const Theme = persistence.Theme;
+pub const Font = persistence.Font;
+pub const ProgressVisibility = persistence.ProgressVisibility;
+pub const ProgressPosition = persistence.ProgressPosition;
+pub const ProgressScope = persistence.ProgressScope;
+pub const SettingsRow = settings_menu.Row;
 pub const Readiness = enum { opening, ready, chapter_error };
 pub const Lifecycle = enum {
     opening,
@@ -89,6 +101,7 @@ pub const ChapterStep = struct {
 
 pub const FrameInput = struct {
     buttons: input.Buttons = .{},
+    a_held: bool = false,
     crank_change: f32 = 0,
     crank_docked: bool = false,
 };
@@ -102,10 +115,17 @@ pub const ReaderCoordinator = struct {
     screen: Screen = .library,
     screen_before_settings: Screen = .reading,
     mode: ReadingMode = .paged,
-    settings_selected: u1 = 0,
+    settings_menu_state: settings_menu.Model = .{},
+    theme: Theme = .light,
+    font: Font = .roobert,
+    progress_visibility: ProgressVisibility = .off,
+    progress_position: ProgressPosition = .top,
+    progress_scope: ProgressScope = .chapter,
     library: library_storage.Library = .{},
     active_book: library_storage.Book = .{},
     pace: reading_pace.Stats = .{ .book_id = 0 },
+    manual_pace: reading_pace.ManualSampler = .{},
+    progress_worker: progress_indexer.Indexer,
     pending_mode_word_ordinal: ?u32 = null,
     chapter_browser: chapter_browser.Model = .{},
     paged: paged_reader.PagedReader,
@@ -142,6 +162,9 @@ pub const ReaderCoordinator = struct {
     telemetry: telemetry.Telemetry = .{},
     crank_accumulated: f32 = 0,
     crank_docked: bool = false,
+    reset_hold_started_at: ?u32 = null,
+    reset_hold_elapsed_ms: u16 = 0,
+    position_save_suppressed: bool = false,
     host: ?reader_host.ReaderHost = null,
     allocator: ?std.mem.Allocator = null,
 
@@ -153,10 +176,17 @@ pub const ReaderCoordinator = struct {
         self.screen = .library;
         self.screen_before_settings = .reading;
         self.mode = .paged;
-        self.settings_selected = 0;
+        self.settings_menu_state = .{};
+        self.theme = .light;
+        self.font = .roobert;
+        self.progress_visibility = .off;
+        self.progress_position = .top;
+        self.progress_scope = .chapter;
         self.library = .{};
         self.active_book = .{};
         self.pace = .{ .book_id = 0 };
+        self.manual_pace = .{};
+        self.progress_worker.initInPlace();
         self.pending_mode_word_ordinal = null;
         self.chapter_browser = .{};
         self.paged.initInPlace(checkpoint_byte_budget);
@@ -180,6 +210,9 @@ pub const ReaderCoordinator = struct {
         self.telemetry = .{};
         self.crank_accumulated = 0;
         self.crank_docked = false;
+        self.reset_hold_started_at = null;
+        self.reset_hold_elapsed_ms = 0;
+        self.position_save_suppressed = false;
         self.host = null;
         self.allocator = null;
     }
@@ -217,36 +250,72 @@ pub const ReaderCoordinator = struct {
         const settings = self.persistence.?.loadSettings();
         self.mode = if (settings.reading_mode == .rsvp) .rsvp else .paged;
         self.rsvp_reader.wpm = settings.rsvp_wpm;
+        self.theme = settings.theme;
+        self.font = settings.font;
+        self.progress_visibility = settings.progress_visibility;
+        self.progress_position = settings.progress_position;
+        self.progress_scope = settings.progress_scope;
     }
 
     pub fn saveSettings(self: *ReaderCoordinator) void {
-        _ = self.persistence.?.saveSettings(.{
+        const service = &(self.persistence orelse return);
+        _ = service.saveSettings(.{
             .reading_mode = if (self.mode == .rsvp) .rsvp else .paged,
             .rsvp_wpm = self.rsvp_reader.wpm,
+            .theme = self.theme,
+            .font = self.font,
+            .progress_visibility = self.progress_visibility,
+            .progress_position = self.progress_position,
+            .progress_scope = self.progress_scope,
         });
     }
 
     pub fn requestPositionSave(self: *ReaderCoordinator) void {
-        if (self.lifecycle == .ready) self.persistence.?.requestWrite(.position, resume_debounce_frames);
+        if (self.lifecycle != .ready or self.position_save_suppressed) return;
+        if (self.persistence) |*service| service.requestWrite(.position, resume_debounce_frames);
+    }
+
+    fn requestPositionSaveAfterReadingMovement(self: *ReaderCoordinator) void {
+        self.position_save_suppressed = false;
+        self.requestPositionSave();
     }
 
     pub fn requestPaceSave(self: *ReaderCoordinator) void {
-        self.persistence.?.requestWrite(.pace, pace_debounce_frames);
+        if (self.persistence) |*service| service.requestWrite(.pace, pace_debounce_frames);
+    }
+
+    fn stopAutoplayAccounting(self: *ReaderCoordinator, now_ms: u32) void {
+        const before = self.pace;
+        self.rsvp_reader.stopAutoplay(now_ms, &self.pace);
+        if (!std.meta.eql(before, self.pace)) self.requestPaceSave();
     }
 
     pub fn flushPersistence(self: *ReaderCoordinator) void {
         if (self.persistence) |*service| {
-            if (self.lifecycle == .ready) _ = service.flushPositionIfDue(self.positionSnapshot());
+            if (self.lifecycle == .ready and !self.position_save_suppressed) _ = service.flushPositionIfDue(self.positionSnapshot());
             _ = service.flushPaceIfDue(self.pace);
+            if (self.progress_worker.snapshot()) |index| {
+                if (service.flushProgressIfDue(index)) self.progress_worker.clearDirty();
+            }
         }
     }
 
     pub fn flushPositionNow(self: *ReaderCoordinator) void {
+        if (self.position_save_suppressed) return;
         if (self.persistence) |*service| _ = service.flushPositionNow(self.positionSnapshot());
     }
 
     pub fn flushPaceNow(self: *ReaderCoordinator) void {
         if (self.persistence) |*service| _ = service.flushPendingPace(self.pace);
+    }
+
+    pub fn flushProgressNow(self: *ReaderCoordinator) void {
+        if (!self.progress_worker.status().dirty) return;
+        const index = self.progress_worker.snapshot() orelse return;
+        if (self.persistence) |*service| {
+            if (!service.writePending(.progress)) service.requestWrite(.progress, 0);
+            if (service.flushPendingProgress(index)) self.progress_worker.clearDirty();
+        }
     }
 
     pub fn restorePosition(self: *ReaderCoordinator) void {
@@ -294,6 +363,7 @@ pub const ReaderCoordinator = struct {
     }
 
     pub fn beginOpening(self: *ReaderCoordinator) void {
+        self.manual_pace.discard();
         self.screen = .opening;
     }
 
@@ -304,9 +374,12 @@ pub const ReaderCoordinator = struct {
     /// Performs the complete semantic exit from a book. Stable platform file
     /// handles are released through ReaderHost slot callbacks.
     pub fn leaveBook(self: *ReaderCoordinator, now_ms: u32) void {
-        self.rsvp_reader.stopAutoplay(now_ms, &self.pace);
+        self.manual_pace.discard();
+        self.stopAutoplayAccounting(now_ms);
         self.flushPaceNow();
         if (self.lifecycle == .ready) self.flushPositionNow();
+        self.flushProgressNow();
+        self.progress_worker.close();
         self.cancelOpening();
         self.cancelPrefetch();
         self.cancelChapter();
@@ -317,12 +390,14 @@ pub const ReaderCoordinator = struct {
         self.pending_mode_word_ordinal = null;
         self.pending_prefetch_transition = null;
         self.paged.detent_backlog = 0;
+        self.clearResetHold();
         self.returnToLibrary();
         self.lifecycle = .opening;
     }
 
     pub fn openSettings(self: *ReaderCoordinator) bool {
         if (self.screen != .reading) return false;
+        self.manual_pace.discard();
         self.screen_before_settings = self.screen;
         self.screen = .settings;
         return true;
@@ -330,12 +405,14 @@ pub const ReaderCoordinator = struct {
 
     pub fn closeSettings(self: *ReaderCoordinator) bool {
         if (self.screen != .settings) return false;
+        self.clearResetHold();
         self.screen = self.screen_before_settings;
         return true;
     }
 
     pub fn openChapterBrowser(self: *ReaderCoordinator) bool {
         if (self.screen != .reading) return false;
+        self.manual_pace.discard();
         self.screen = .chapter_browser;
         return true;
     }
@@ -359,7 +436,32 @@ pub const ReaderCoordinator = struct {
 
     pub fn moveSettingsSelection(self: *ReaderCoordinator, direction: i8) void {
         if (self.screen != .settings or direction == 0) return;
-        self.settings_selected = if (self.settings_selected == 0) 1 else 0;
+        self.clearResetHold();
+        self.settings_menu_state.move(direction);
+    }
+
+    fn clearResetHold(self: *ReaderCoordinator) void {
+        self.reset_hold_started_at = null;
+        self.reset_hold_elapsed_ms = 0;
+    }
+
+    fn updateResetHold(self: *ReaderCoordinator, a_held: bool, a_pressed: bool, now_ms: u32) void {
+        if (self.screen != .settings or self.settings_menu_state.selected != .reset_progress or !a_held) {
+            self.clearResetHold();
+            return;
+        }
+        if (self.reset_hold_started_at == null) {
+            if (!a_pressed) return;
+            self.reset_hold_started_at = now_ms;
+        }
+
+        const elapsed = @min(now_ms -% self.reset_hold_started_at.?, reset_hold_duration_ms);
+        self.reset_hold_elapsed_ms = @intCast(elapsed);
+        if (elapsed < reset_hold_duration_ms) return;
+
+        if (self.persistence) |*service| _ = service.deletePosition(self.bookIdentity());
+        self.position_save_suppressed = true;
+        self.leaveBook(now_ms);
     }
 
     pub fn openChapters(self: *ReaderCoordinator, entry_count: u8, current: u8) bool {
@@ -377,6 +479,9 @@ pub const ReaderCoordinator = struct {
     /// Starts a fresh opening workflow for the selected library entry.
     pub fn openSelectedBook(self: *ReaderCoordinator) bool {
         _ = self.selectBook() orelse return false;
+        self.progress_worker.close();
+        self.position_save_suppressed = false;
+        self.clearResetHold();
         if (self.persistence) |*service| self.pace = service.loadPace(persistence.Service.bookIdentity(self.active_book.slice()));
         self.lifecycle = .opening;
         self.beginOpening();
@@ -582,11 +687,31 @@ pub const ReaderCoordinator = struct {
             job.closeFileLease();
         }
         self.opening_job = null;
+        self.chapter_index = 0;
+        self.startProgressIndexing();
         self.archive_index = null;
         self.lifecycle = .ready;
         self.beginReading();
-        self.chapter_index = 0;
         self.opening_chapter_request = 0;
+    }
+
+    fn startProgressIndexing(self: *ReaderCoordinator) void {
+        const host = self.host orelse return;
+        const files = host.files orelse return;
+        const directory = if (self.archive_index) |*value| value else return;
+        const key = reading_progress.Key{
+            .book_id = self.bookIdentity(),
+            .publication_fingerprint = publicationFingerprint(&self.publication, directory),
+            .word_semantics_revision = word_semantics_revision,
+            .spine_len = self.publication.spine_len,
+        };
+        const fresh = reading_progress.Index.init(key) catch return;
+        const index = if (self.persistence) |*service| service.loadProgress(key) orelse fresh else fresh;
+        const reader = files.open(files.context, .progress, self.active_book.zSlice()) catch return;
+        self.progress_worker.open(index, &self.publication, self.chapter_index, reader, .{
+            .context = self,
+            .close = closeProgressHostLease,
+        }) catch return;
     }
 
     /// Consumes the semantic chapter-opening request made by a successful
@@ -614,6 +739,7 @@ pub const ReaderCoordinator = struct {
     /// Begins a bounded chapter open through the stable chapter host slot.
     /// Replacing a request first releases the prior stream and its lease.
     pub fn openChapter(self: *ReaderCoordinator, index: u8, action: ChapterOpenAction) void {
+        self.manual_pace.discard();
         self.pending_prefetch_transition = null;
         self.cancelPrefetch();
         self.cancelChapter();
@@ -745,6 +871,7 @@ pub const ReaderCoordinator = struct {
                             self.failChapter(.archive);
                             return .{ .worked = true };
                         };
+                        self.observeVerifiedChapterTotal(self.rsvp_reader.wordCount());
                         self.telemetry.setChapterEvents(self.rsvp_reader.event_count);
                         var position_changed = false;
                         if (self.rsvp_reader.hasWord()) {
@@ -775,6 +902,7 @@ pub const ReaderCoordinator = struct {
                         self.failChapter(.archive);
                         return .{ .worked = true };
                     };
+                    self.observeVerifiedChapterTotal(self.paged.wordCount());
                     self.decode_workspace.markActiveVerifiedEof();
                     if (!self.paged.isRescanning() and !self.paged.current_ready and !self.paged.next_ready) {
                         if (self.nextReadableChapter()) |next| {
@@ -821,6 +949,7 @@ pub const ReaderCoordinator = struct {
             return err;
         };
         self.chapter_index = index;
+        self.progress_worker.setCurrentChapter(index) catch {};
         const measure = self.host.?.measure;
         self.paged.begin(index, reader_layout.text_width, paginationMeasure(measure));
         self.chapter_end = false;
@@ -832,6 +961,12 @@ pub const ReaderCoordinator = struct {
             self.paged.extractor = null;
             self.rsvp_reader.begin(index);
         }
+    }
+
+    fn observeVerifiedChapterTotal(self: *ReaderCoordinator, words: u32) void {
+        const changed = self.progress_worker.observeChapterTotal(self.chapter_index, words) catch return;
+        if (!changed) return;
+        if (self.persistence) |*service| service.requestWrite(.progress, progress_debounce_frames);
     }
 
     /// Cancels chapter lookup/decoding and releases its stable host slot once.
@@ -1005,6 +1140,7 @@ pub const ReaderCoordinator = struct {
     }
 
     fn failChapter(self: *ReaderCoordinator, failure: ChapterFailure) void {
+        self.manual_pace.discard();
         self.chapter_failure = failure;
         self.paged.current_ready = false;
         self.paged.next_ready = false;
@@ -1046,6 +1182,7 @@ pub const ReaderCoordinator = struct {
     }
 
     fn failOpening(self: *ReaderCoordinator, failure: Lifecycle) void {
+        self.manual_pace.discard();
         if (self.opening_job) |*job| {
             if (self.allocator) |allocator| {
                 job.cancel(allocator);
@@ -1070,7 +1207,8 @@ pub const ReaderCoordinator = struct {
             .buttons = frame.buttons,
         });
         self.performIntent(intent, now_ms);
-        self.handleCrank(frame.crank_change);
+        self.updateResetHold(frame.a_held, frame.buttons.a, now_ms);
+        self.handleCrank(frame.crank_change, now_ms);
         self.advanceAutoplay(now_ms);
 
         self.advanceOpening();
@@ -1082,18 +1220,76 @@ pub const ReaderCoordinator = struct {
         if (chapter.position_changed) self.requestPositionSave();
         if (chapter.request_prefetch) _ = self.startPrefetch();
         self.fulfillPendingPagedSelection();
-        if (self.mode == .paged and !self.crank_docked) self.drainPagedDetents();
+        if (self.mode == .paged and !self.crank_docked) self.drainPagedDetents(now_ms);
+        const prefetch_worked = self.paged.prefetch.isPrefetching();
         self.stepPrefetch();
+        self.stepProgressIndex(chapter.worked or prefetch_worked);
+        self.syncManualPace(now_ms);
         self.flushPersistence();
+    }
+
+    fn stepProgressIndex(self: *ReaderCoordinator, foreground_worked: bool) void {
+        if (foreground_worked or self.screen != .reading or self.lifecycle != .ready) return;
+        if (self.chapter_open != null or self.chapterIsReconstructing()) return;
+        if (self.paged.pending_selection != null or self.paged.detent_backlog != 0 or self.pending_prefetch_transition != null) return;
+
+        switch (self.progress_worker.update(progress_indexer.default_byte_budget)) {
+            .chapter_complete, .chapter_failed => {
+                if (self.persistence) |*service| service.requestWrite(.progress, progress_debounce_frames);
+            },
+            else => {},
+        }
+    }
+
+    fn visibleManualPaceAnchor(self: *const ReaderCoordinator) ?reading_pace.ManualAnchor {
+        if (self.screen != .reading or self.lifecycle != .ready or self.chapter_open != null) return null;
+        return switch (self.mode) {
+            .paged => blk: {
+                if (self.paged.isReconstructing() or self.paged.pending_selection != null) break :blk null;
+                _ = self.paged.current() orelse break :blk null;
+                break :blk .{ .paged = .{ .chapter = self.chapter_index, .page = self.paged.page_index } };
+            },
+            .rsvp => blk: {
+                if (self.rsvp_reader.timer.running or self.rsvp_reader.isReconstructing() or !self.rsvp_reader.hasWord()) break :blk null;
+                break :blk .{ .rsvp = .{ .chapter = self.chapter_index, .word = self.rsvp_reader.position().word } };
+            },
+        };
+    }
+
+    fn syncManualPace(self: *ReaderCoordinator, now_ms: u32) void {
+        const anchor = self.visibleManualPaceAnchor() orelse {
+            self.manual_pace.discard();
+            return;
+        };
+        self.manual_pace.observe(anchor, now_ms);
+    }
+
+    fn recordManualPace(self: *ReaderCoordinator, anchor: ?reading_pace.ManualAnchor, now_ms: u32, completed_words: u32) void {
+        const observed = anchor orelse return;
+        if (!self.manual_pace.recordForward(&self.pace, observed, now_ms, completed_words)) return;
+        self.requestPaceSave();
+    }
+
+    pub fn systemPaused(self: *ReaderCoordinator, now_ms: u32) void {
+        self.manual_pace.discard();
+        self.stopAutoplayAccounting(now_ms);
+        self.flushPaceNow();
+    }
+
+    pub fn systemResumed(self: *ReaderCoordinator) void {
+        self.manual_pace.discard();
     }
 
     pub fn handleSystemAction(self: *ReaderCoordinator, action: SystemAction, now_ms: u32) void {
         switch (action) {
             .library => self.leaveBook(now_ms),
-            .settings => _ = self.openSettings(),
+            .settings => {
+                if (self.screen == .reading) self.stopAutoplayAccounting(now_ms);
+                _ = self.openSettings();
+            },
             .chapters => {
                 if (self.screen != .reading or self.publication.spine_len == 0) return;
-                self.rsvp_reader.stopAutoplay(now_ms, &self.pace);
+                self.stopAutoplayAccounting(now_ms);
                 self.crank_accumulated = 0;
                 _ = self.openChapters(self.publication.spine_len, self.chapter_index);
             },
@@ -1124,9 +1320,34 @@ pub const ReaderCoordinator = struct {
             },
             .settings_next => self.moveSettingsSelection(1),
             .settings_previous => self.moveSettingsSelection(-1),
-            .activate_setting => if (self.settings_selected == 0) self.switchReadingMode(now_ms) else {
-                _ = self.rsvp_reader.adjustWpm(1, now_ms, &self.pace);
-                self.saveSettings();
+            .activate_setting => switch (self.settings_menu_state.selected) {
+                .reading_mode => self.switchReadingMode(now_ms),
+                .rsvp_wpm => {
+                    _ = self.rsvp_reader.adjustWpm(1, now_ms, &self.pace);
+                    self.saveSettings();
+                },
+                .theme => {
+                    self.theme = if (self.theme == .light) .dark else .light;
+                    self.saveSettings();
+                },
+                .font => self.switchFont(),
+                .progress_visibility => {
+                    self.progress_visibility = if (self.progress_visibility == .off) .on else .off;
+                    self.saveSettings();
+                },
+                .progress_position => {
+                    self.progress_position = if (self.progress_position == .top) .bottom else .top;
+                    self.saveSettings();
+                },
+                .progress_scope => {
+                    self.progress_scope = switch (self.progress_scope) {
+                        .chapter => .book,
+                        .book => .both,
+                        .both => .chapter,
+                    };
+                    self.saveSettings();
+                },
+                .statistics, .reset_progress => {},
             },
             .toggle_reading_mode => self.switchReadingMode(now_ms),
             .rsvp_toggle_autoplay => if (self.screen == .reading and self.mode == .rsvp) self.rsvp_reader.toggleAutoplay(now_ms, &self.pace),
@@ -1136,13 +1357,34 @@ pub const ReaderCoordinator = struct {
             .next_page => {
                 self.paged.pending_selection = null;
                 if (self.lifecycle == .ready and self.chapter_open == null) {
-                    self.handlePagedMove(self.paged.nextPage());
-                    self.requestPositionSave();
+                    const pace_anchor = self.visibleManualPaceAnchor();
+                    const completed_words = if (self.paged.current()) |page| page.word_count else 0;
+                    const move = self.paged.nextPage();
+                    if (move == .moved or (move == .needs_next_chapter and self.chapter_index + 1 < self.publication.spine_len)) {
+                        self.recordManualPace(pace_anchor, now_ms, completed_words);
+                    }
+                    const changes_position = switch (move) {
+                        .moved, .needs_reconstruction => true,
+                        .needs_next_chapter => self.chapter_index + 1 < self.publication.spine_len,
+                        .needs_previous_chapter, .waiting, .at_limit => false,
+                    };
+                    self.handlePagedMove(move);
+                    if (changes_position) self.requestPositionSaveAfterReadingMovement();
                 }
             },
             .previous_page => {
+                self.manual_pace.discard();
                 self.paged.pending_selection = null;
-                if (self.lifecycle == .ready and self.chapter_open == null) self.handlePagedMove(self.paged.previousPage());
+                if (self.lifecycle == .ready and self.chapter_open == null) {
+                    const move = self.paged.previousPage();
+                    const changes_position = switch (move) {
+                        .moved, .needs_reconstruction => true,
+                        .needs_previous_chapter => self.chapter_index != 0,
+                        .needs_next_chapter, .waiting, .at_limit => false,
+                    };
+                    self.handlePagedMove(move);
+                    if (changes_position) self.requestPositionSaveAfterReadingMovement();
+                }
             },
             .next_chapter => self.openAdjacentChapter(1),
             .previous_chapter => self.openAdjacentChapter(-1),
@@ -1155,7 +1397,7 @@ pub const ReaderCoordinator = struct {
         else
             self.rsvp_reader.position().word;
         self.toggleMode();
-        self.rsvp_reader.stopAutoplay(now_ms, &self.pace);
+        self.stopAutoplayAccounting(now_ms);
         self.paged.pending_selection = null;
         self.paged.detent_backlog = 0;
         self.crank_accumulated = 0;
@@ -1173,8 +1415,21 @@ pub const ReaderCoordinator = struct {
         self.saveSettings();
     }
 
+    fn switchFont(self: *ReaderCoordinator) void {
+        self.font = if (self.font == .roobert) .newsleak_serif else .roobert;
+        self.saveSettings();
+        if (self.lifecycle != .ready or self.mode != .paged) return;
+
+        const target_word = reader_transitions.pagedModeSwitchOrdinal(self.currentPagedWordOrdinal(), self.paged.pending_selection);
+        self.pending_mode_word_ordinal = target_word;
+        self.paged.pending_selection = .{ .ordinal = target_word };
+        self.openChapter(self.chapter_index, .{ .word_rescan = target_word });
+        self.requestPositionSave();
+    }
+
     fn adjustRsvpWpm(self: *ReaderCoordinator, direction: i8, now_ms: u32) void {
         if (self.screen != .reading or self.mode != .rsvp) return;
+        self.manual_pace.discard();
         if (!self.rsvp_reader.adjustWpm(direction, now_ms, &self.pace)) return;
         self.requestPaceSave();
         self.saveSettings();
@@ -1190,13 +1445,14 @@ pub const ReaderCoordinator = struct {
 
     fn previousRsvpSentence(self: *ReaderCoordinator, now_ms: u32) void {
         if (self.lifecycle != .ready or self.chapter_open != null) return;
+        self.manual_pace.discard();
         self.rsvp_reader.recordAutoplay(now_ms, 0, &self.pace);
         self.requestPaceSave();
         self.rsvp_reader.timer.reset(now_ms);
         self.handleRsvpMove(self.rsvp_reader.previousSentence());
     }
 
-    fn handleCrank(self: *ReaderCoordinator, change: f32) void {
+    fn handleCrank(self: *ReaderCoordinator, change: f32, now_ms: u32) void {
         if (self.screen == .chapter_browser) {
             self.chapter_browser.move(crankDetents(&self.crank_accumulated, change));
             return;
@@ -1205,16 +1461,26 @@ pub const ReaderCoordinator = struct {
         if (self.screen != .reading or self.lifecycle != .ready or self.chapter_open != null or self.paged.isRescanning()) return;
         if (self.mode == .rsvp) {
             if (self.rsvp_reader.timer.running) return;
-            const move = switch (crankDirection(&self.crank_accumulated, change)) {
+            const direction = crankDirection(&self.crank_accumulated, change);
+            const pace_anchor = self.visibleManualPaceAnchor();
+            const move = switch (direction) {
                 1 => self.rsvp_reader.nextWord(),
-                -1 => self.rsvp_reader.previousWord(),
+                -1 => blk: {
+                    self.manual_pace.discard();
+                    break :blk self.rsvp_reader.previousWord();
+                },
                 else => return,
+            };
+            if (direction > 0) switch (move) {
+                .moved, .needs_word => self.recordManualPace(pace_anchor, now_ms, 1),
+                .needs_next_chapter => if (self.chapter_index + 1 < self.publication.spine_len) self.recordManualPace(pace_anchor, now_ms, 1),
+                else => {},
             };
             self.handleRsvpMove(move);
             return;
         }
         self.paged.detent_backlog = saturatingAddDetents(self.paged.detent_backlog, crankDetents(&self.crank_accumulated, change));
-        self.drainPagedDetents();
+        self.drainPagedDetents(now_ms);
     }
 
     fn updateCrankDockState(self: *ReaderCoordinator, docked: bool) void {
@@ -1233,11 +1499,11 @@ pub const ReaderCoordinator = struct {
         }
     }
 
-    fn drainPagedDetents(self: *ReaderCoordinator) void {
+    fn drainPagedDetents(self: *ReaderCoordinator, now_ms: u32) void {
         while (self.paged.detent_backlog != 0) {
             if (self.paged.pending_selection != null) return;
             const direction: i8 = if (self.paged.detent_backlog > 0) 1 else -1;
-            switch (self.movePagedSelection(direction)) {
+            switch (self.movePagedSelection(direction, now_ms)) {
                 .advanced => self.paged.detent_backlog -= direction,
                 .waiting_for_page => return,
                 .at_limit => {
@@ -1248,20 +1514,39 @@ pub const ReaderCoordinator = struct {
         }
     }
 
-    fn movePagedSelection(self: *ReaderCoordinator, direction: i8) PagedSelectionMove {
+    fn movePagedSelection(self: *ReaderCoordinator, direction: i8, now_ms: u32) PagedSelectionMove {
+        const pace_anchor = self.visibleManualPaceAnchor();
+        const page_before = self.paged.page_index;
+        const completed_words = if (self.paged.current()) |page| page.word_count else 0;
+        if (direction < 0) self.manual_pace.discard();
         const move = self.paged.moveSelection(direction, self.chapter_index != 0, self.chapter_index + 1 < self.publication.spine_len);
+        if (direction > 0 and (self.paged.page_index > page_before or (move == .needs_next_chapter and self.chapter_index + 1 < self.publication.spine_len))) {
+            self.recordManualPace(pace_anchor, now_ms, completed_words);
+        }
         self.handlePagedMove(move);
         return switch (move) {
             .moved => blk: {
                 self.fulfillPendingPagedSelection();
                 if (self.paged.pending_selection == null) {
-                    self.requestPositionSave();
+                    self.requestPositionSaveAfterReadingMovement();
                     break :blk .advanced;
                 }
                 break :blk .waiting_for_page;
             },
             .at_limit => .at_limit,
-            .waiting, .needs_reconstruction, .needs_previous_chapter, .needs_next_chapter => .waiting_for_page,
+            .needs_reconstruction => blk: {
+                self.requestPositionSaveAfterReadingMovement();
+                break :blk .waiting_for_page;
+            },
+            .needs_previous_chapter => blk: {
+                if (self.chapter_index != 0) self.requestPositionSaveAfterReadingMovement();
+                break :blk .waiting_for_page;
+            },
+            .needs_next_chapter => blk: {
+                if (self.chapter_index + 1 < self.publication.spine_len) self.requestPositionSaveAfterReadingMovement();
+                break :blk .waiting_for_page;
+            },
+            .waiting => .waiting_for_page,
         };
     }
 
@@ -1274,10 +1559,17 @@ pub const ReaderCoordinator = struct {
 
     fn handleRsvpMove(self: *ReaderCoordinator, move: rsvp_reader.RsvpReader.Move) void {
         switch (move) {
-            .moved => self.requestPositionSave(),
-            .needs_word, .waiting, .at_limit => {},
-            .needs_rescan => |target| self.openChapter(self.chapter_index, .{ .rsvp_rescan = target }),
-            .needs_next_chapter => if (self.nextReadableChapter()) |next| self.openChapter(next, .normal),
+            .moved => self.requestPositionSaveAfterReadingMovement(),
+            .needs_word => self.requestPositionSaveAfterReadingMovement(),
+            .waiting, .at_limit => {},
+            .needs_rescan => |target| {
+                self.requestPositionSaveAfterReadingMovement();
+                self.openChapter(self.chapter_index, .{ .rsvp_rescan = target });
+            },
+            .needs_next_chapter => if (self.nextReadableChapter()) |next| {
+                self.requestPositionSaveAfterReadingMovement();
+                self.openChapter(next, .normal);
+            },
         }
     }
 
@@ -1295,7 +1587,19 @@ pub const ReaderCoordinator = struct {
                 for (self.library.books[0..self.library.len], 0..) |*book, index| paths[index] = book.slice();
                 return .{ .library = .{ .paths = paths, .count = self.library.len, .selected = self.library.selected } };
             },
-            .settings => return .{ .settings = .{ .selected = self.settings_selected, .mode = self.mode, .wpm = self.rsvp_reader.wpm } },
+            .settings => return .{ .settings = .{
+                .selected = self.settings_menu_state.selected,
+                .first_visible = self.settings_menu_state.first_visible,
+                .row_count = self.settings_menu_state.displayedCount(),
+                .mode = self.mode,
+                .wpm = self.rsvp_reader.wpm,
+                .theme = self.theme,
+                .font = self.font,
+                .progress_visibility = self.progress_visibility,
+                .progress_position = self.progress_position,
+                .progress_scope = self.progress_scope,
+                .reset_hold_ms = self.reset_hold_elapsed_ms,
+            } },
             .chapter_browser => {
                 var rows = [_]ChapterRowView{.{}} ** chapter_browser.visible_rows;
                 const count = self.chapter_browser.displayedCount();
@@ -1339,6 +1643,8 @@ pub const ReaderCoordinator = struct {
                         .selected_span = selected_span,
                         .page_index = state.page_index,
                         .waiting = state.waiting_for_page,
+                        .reconstructing = state.reconstructing,
+                        .progress = self.progressView(),
                     } };
                 },
                 .rsvp => blk: {
@@ -1351,6 +1657,7 @@ pub const ReaderCoordinator = struct {
                         .reconstructing = self.rsvp_reader.isReconstructing(),
                         .playing = state.playing,
                         .wpm = state.wpm,
+                        .progress = self.progressView(),
                     } };
                 },
             },
@@ -1376,6 +1683,16 @@ pub const ReaderCoordinator = struct {
     pub fn setTelemetryEnabled(self: *ReaderCoordinator, enabled: bool) void {
         self.telemetry.setEnabled(enabled);
     }
+
+    fn progressView(self: *const ReaderCoordinator) ?reading_progress.View {
+        const index = self.progress_worker.snapshot() orelse return null;
+        if (self.chapter_index >= index.key.spine_len) return null;
+        const word_ordinal = self.pending_mode_word_ordinal orelse switch (self.mode) {
+            .paged => self.currentPagedWordOrdinal(),
+            .rsvp => self.rsvp_reader.position().word,
+        };
+        return index.view(.{ .chapter = self.chapter_index, .word_ordinal = word_ordinal }) catch null;
+    }
 };
 
 fn closeOpeningHostLease(context: *anyopaque) void {
@@ -1388,6 +1705,37 @@ fn closePrefetchHostLease(context: *anyopaque) void {
     const self: *ReaderCoordinator = @ptrCast(@alignCast(context));
     const files = self.host.?.files orelse return;
     files.close(files.context, .prefetch);
+}
+
+fn closeProgressHostLease(context: *anyopaque) void {
+    const self: *ReaderCoordinator = @ptrCast(@alignCast(context));
+    const files = self.host.?.files orelse return;
+    files.close(files.context, .progress);
+}
+
+fn publicationFingerprint(publication: *const epub.Publication, directory: *const zip.DirectoryIndex) [16]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (publication.spine[0..publication.spine_len]) |*spine| {
+        const path = spine.slice();
+        var path_length: [2]u8 = undefined;
+        std.mem.writeInt(u16, &path_length, @intCast(path.len), .little);
+        hasher.update(&path_length);
+        hasher.update(path);
+
+        const entry = directory.find(path) catch {
+            hasher.update(&.{0});
+            continue;
+        };
+        hasher.update(&.{1});
+        var metadata: [12]u8 = undefined;
+        std.mem.writeInt(u32, metadata[0..4], entry.crc32, .little);
+        std.mem.writeInt(u32, metadata[4..8], entry.compressed_size, .little);
+        std.mem.writeInt(u32, metadata[8..12], entry.uncompressed_size, .little);
+        hasher.update(&metadata);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest[0..16].*;
 }
 
 pub const InputSnapshot = struct {
@@ -1481,6 +1829,8 @@ pub const PagedView = struct {
     selected_span: ?pagination.PageCache.WordSpan,
     page_index: u32,
     waiting: bool,
+    reconstructing: bool,
+    progress: ?reading_progress.View = null,
 };
 
 pub const ByteSpan = struct { start: usize, end: usize };
@@ -1492,6 +1842,7 @@ pub const RsvpView = struct {
     reconstructing: bool = false,
     playing: bool,
     wpm: u16,
+    progress: ?reading_progress.View = null,
 };
 
 pub const ChapterErrorView = struct {
@@ -1504,9 +1855,23 @@ pub const RenderModel = union(enum) {
     opening,
     paged: PagedView,
     rsvp: RsvpView,
-    settings: struct { selected: u1, mode: ReadingMode, wpm: u16 },
+    settings: SettingsView,
     chapters: ChaptersView,
     failure: ErrorView,
+};
+
+pub const SettingsView = struct {
+    selected: SettingsRow,
+    first_visible: u4,
+    row_count: u4,
+    mode: ReadingMode,
+    wpm: u16,
+    theme: Theme,
+    font: Font,
+    progress_visibility: ProgressVisibility,
+    progress_position: ProgressPosition,
+    progress_scope: ProgressScope,
+    reset_hold_ms: u16,
 };
 
 pub const ErrorView = union(enum) {
@@ -1597,6 +1962,50 @@ test "coordinator raises only semantic reconstruction work to the reconstruction
     coordinator.mode = .rsvp;
     coordinator.rsvp_reader.reconstruct(.{ .word = 12 });
     try std.testing.expectEqual(limits.reconstruction_bytes_per_update, coordinator.chapterWorkBudget());
+}
+
+test "manual Paged and RSVP forward reading samples once while reverse movement is discarded" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.publication.spine_len = 1;
+    coordinator.pace = .{ .book_id = 7 };
+
+    coordinator.paged.current_ready = true;
+    coordinator.paged.next_ready = true;
+    coordinator.paged.current_page = 0;
+    coordinator.paged.next_page = 1;
+    coordinator.paged.chapter_end = true;
+    coordinator.paged.chapter_last_page = 1;
+    coordinator.paged.pages[0].first_word_ordinal = 0;
+    coordinator.paged.pages[0].word_count = 10;
+    coordinator.paged.pages[1].first_word_ordinal = 10;
+    coordinator.paged.pages[1].word_count = 8;
+    coordinator.syncManualPace(0);
+    coordinator.performIntent(.next_page, 1_000);
+    try std.testing.expectEqual(@as(u32, 10), coordinator.pace.completed_words);
+    try std.testing.expectEqual(@as(u32, 1_000), coordinator.pace.active_ms);
+
+    coordinator.syncManualPace(1_000);
+    coordinator.performIntent(.previous_page, 1_500);
+    try std.testing.expectEqual(@as(u32, 10), coordinator.pace.completed_words);
+    try std.testing.expectEqual(@as(u32, 1_000), coordinator.pace.active_ms);
+
+    coordinator.mode = .rsvp;
+    coordinator.rsvp_reader.begin(0);
+    _ = try coordinator.rsvp_reader.feed("<p>one two</p>");
+    try coordinator.rsvp_reader.finishInput();
+    try std.testing.expectEqual(rsvp_reader.RsvpReader.Move.moved, coordinator.rsvp_reader.previousWord());
+    coordinator.syncManualPace(2_000);
+    coordinator.handleCrank(crank_degrees_per_word, 2_500);
+    try std.testing.expectEqual(@as(u32, 11), coordinator.pace.completed_words);
+    try std.testing.expectEqual(@as(u32, 1_500), coordinator.pace.active_ms);
+
+    coordinator.syncManualPace(2_500);
+    coordinator.handleCrank(-crank_degrees_per_word, 3_000);
+    try std.testing.expectEqual(@as(u32, 11), coordinator.pace.completed_words);
+    try std.testing.expectEqual(@as(u32, 1_500), coordinator.pace.active_ms);
 }
 
 const LibraryHostFake = struct {
@@ -1950,15 +2359,32 @@ test "coordinator owns screen lifecycle without reader or platform state" {
     try std.testing.expectEqual(Screen.library, coordinator.screen);
 }
 
-test "coordinator owns mode and settings selection" {
+test "scrolling settings keeps every selection visible and reset hold uninterrupted" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
     coordinator.beginReading();
     coordinator.toggleMode();
     try std.testing.expectEqual(ReadingMode.rsvp, coordinator.mode);
     try std.testing.expect(coordinator.openSettings());
+    for (1..settings_menu.row_count) |row| {
+        coordinator.moveSettingsSelection(1);
+        try std.testing.expectEqual(@as(u4, @intCast(row)), @intFromEnum(coordinator.settings_menu_state.selected));
+        const first = coordinator.settings_menu_state.first_visible;
+        try std.testing.expect(@intFromEnum(coordinator.settings_menu_state.selected) >= first);
+        try std.testing.expect(@intFromEnum(coordinator.settings_menu_state.selected) < first + coordinator.settings_menu_state.displayedCount());
+    }
+    try std.testing.expectEqual(SettingsRow.reset_progress, coordinator.settings_menu_state.selected);
+
+    coordinator.updateResetHold(true, true, 100);
+    coordinator.updateResetHold(true, false, 2_000);
+    coordinator.moveSettingsSelection(-1);
+    try std.testing.expectEqual(@as(u16, 0), coordinator.reset_hold_elapsed_ms);
     coordinator.moveSettingsSelection(1);
-    try std.testing.expectEqual(@as(u1, 1), coordinator.settings_selected);
+    coordinator.updateResetHold(true, true, 2_100);
+    coordinator.updateResetHold(true, false, 5_099);
+    try std.testing.expectEqual(Screen.settings, coordinator.screen);
+    coordinator.updateResetHold(true, false, 5_100);
+    try std.testing.expectEqual(Screen.library, coordinator.screen);
 }
 
 test "coordinator retains bounded library and chapter-browser navigation state" {
@@ -2058,6 +2484,10 @@ const StoredChapterHostFake = struct {
         @memcpy(destination, self.bytes[start..][0..destination.len]);
     }
 
+    fn reader(self: *StoredChapterHostFake) zip.Reader {
+        return .{ .context = self, .size = archive_size, .read_at = readAt };
+    }
+
     fn open(context: *anyopaque, slot: reader_host.FileSlot, _: [:0]const u8) reader_host.FileError!zip.Reader {
         const self: *StoredChapterHostFake = @ptrCast(@alignCast(context));
         self.open_calls += 1;
@@ -2071,6 +2501,64 @@ const StoredChapterHostFake = struct {
         return text.len * 8;
     }
 };
+
+test "coordinator idles indexing for foreground work and shares verified progress across modes" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    var fake = StoredChapterHostFake.init();
+    coordinator.attachHost(.{
+        .files = .{ .context = &fake, .open = StoredChapterHostFake.open, .close = StoredChapterHostFake.close, .list_epubs = StoredChapterHostFake.list },
+        .measure = .{ .context = &fake, .width = StoredChapterHostFake.width },
+    });
+    coordinator.library.add("book.epub");
+    _ = coordinator.selectBook();
+    @memset(std.mem.asBytes(&coordinator.publication), 0);
+    @memcpy(coordinator.publication.spine[0].path[0..StoredChapterHostFake.name.len], StoredChapterHostFake.name);
+    coordinator.publication.spine[0].path_len = StoredChapterHostFake.name.len;
+    coordinator.publication.spine_len = 1;
+
+    var scan_buffer: [64]u8 = undefined;
+    var filename_buffer: [64]u8 = undefined;
+    const archive = try zip.Archive.open(fake.reader(), &scan_buffer);
+    var indexed_entries: [1]zip.IndexedEntry = undefined;
+    indexed_entries[0].name_len = StoredChapterHostFake.name.len;
+    @memcpy(indexed_entries[0].name[0..StoredChapterHostFake.name.len], StoredChapterHostFake.name);
+    indexed_entries[0].entry = try archive.find(StoredChapterHostFake.name, &filename_buffer);
+    coordinator.archive_index = .{ .archive = archive, .entries = &indexed_entries };
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.startProgressIndexing();
+
+    const before = coordinator.progress_worker.status();
+    coordinator.stepProgressIndex(true);
+    try std.testing.expectEqual(before.phase, coordinator.progress_worker.status().phase);
+    for (0..32) |_| {
+        coordinator.stepProgressIndex(false);
+        if (coordinator.progress_worker.status().phase == .counting) break;
+    }
+    try std.testing.expectEqual(progress_indexer.Phase.counting, coordinator.progress_worker.status().phase);
+
+    coordinator.observeVerifiedChapterTotal(2);
+    try std.testing.expect(coordinator.progress_worker.snapshot().?.exact.contains(0));
+    try std.testing.expect(coordinator.progress_worker.status().target_chapter == null);
+
+    switch (coordinator.renderModel()) {
+        .paged => |view| try expectExactProgress(view.progress, 1, 2),
+        else => return error.TestUnexpectedResult,
+    }
+    coordinator.mode = .rsvp;
+    switch (coordinator.renderModel()) {
+        .rsvp => |view| try expectExactProgress(view.progress, 1, 2),
+        else => return error.TestUnexpectedResult,
+    }
+    coordinator.progress_worker.close();
+}
+
+fn expectExactProgress(view: ?reading_progress.View, reached: u32, total: u32) !void {
+    const exact = (view orelse return error.TestExpectedEqual).chapter.exact;
+    try std.testing.expectEqual(reading_progress.WideCount.fromU32(reached), exact.reached);
+    try std.testing.expectEqual(reading_progress.WideCount.fromU32(total), exact.total);
+}
 
 test "chapter work acquires and cancellation releases the typed chapter slot" {
     var coordinator: ReaderCoordinator = undefined;

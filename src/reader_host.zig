@@ -5,7 +5,7 @@ pub const Library = library_storage.Library;
 
 /// Stable file leases belong to the platform adapter. The coordinator refers
 /// to them by role and receives only a platform-neutral ZIP reader.
-pub const FileSlot = enum { opening, chapter, prefetch };
+pub const FileSlot = enum { opening, chapter, prefetch, progress };
 pub const FileError = error{OpenFailed};
 
 pub const Files = struct {

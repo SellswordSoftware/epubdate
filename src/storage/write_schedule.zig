@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Kind = enum { position, pace };
+pub const Kind = enum { position, pace, progress };
 
 /// Debounces independent position and pace writes without knowing how either
 /// record is encoded or persisted. A due request remains pending until its
@@ -8,6 +8,7 @@ pub const Kind = enum { position, pace };
 pub const WriteSchedule = struct {
     position_delay: ?u8 = null,
     pace_delay: ?u8 = null,
+    progress_delay: ?u8 = null,
 
     pub fn request(self: *WriteSchedule, kind: Kind, delay_frames: u8) void {
         self.delay(kind).* = delay_frames;
@@ -38,6 +39,7 @@ pub const WriteSchedule = struct {
         return switch (kind) {
             .position => &self.position_delay,
             .pace => &self.pace_delay,
+            .progress => &self.progress_delay,
         };
     }
 
@@ -45,6 +47,7 @@ pub const WriteSchedule = struct {
         return switch (kind) {
             .position => &self.position_delay,
             .pace => &self.pace_delay,
+            .progress => &self.progress_delay,
         };
     }
 };

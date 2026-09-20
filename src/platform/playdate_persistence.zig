@@ -9,6 +9,7 @@ pub fn fileStore(file_api: *const pdapi.PlaydateFile) persistence.FileStore {
         .context = @ptrCast(@constCast(file_api)),
         .read = read,
         .write = write,
+        .delete = delete,
     };
 }
 
@@ -29,4 +30,11 @@ fn write(context: *anyopaque, name: []const u8, input: []const u8) bool {
     defer _ = file_api.close(file);
     if (file_api.write(file, input.ptr, @intCast(input.len)) != @as(c_int, @intCast(input.len))) return false;
     return file_api.flush(file) == 0;
+}
+
+fn delete(context: *anyopaque, name: []const u8) bool {
+    const file_api: *const pdapi.PlaydateFile = @ptrCast(@alignCast(context));
+    var filename_buffer: [32]u8 = undefined;
+    const filename = std.fmt.bufPrintZ(&filename_buffer, "{s}", .{name}) catch return false;
+    return file_api.unlink(filename.ptr, 0) == 0;
 }

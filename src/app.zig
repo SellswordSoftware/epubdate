@@ -22,23 +22,28 @@ pub const App = struct {
     // Once a chapter's final page is known, the Paged engine reserves an
     // unpinned cache slot for the first page of the following chapter.
     prefetch_file: ?PlaydateFileReader = null,
+    // Progress indexing owns an independent stream and decoder workspace.
+    progress_file: ?PlaydateFileReader = null,
     telemetry_menu: ?*pdapi.PDMenuItem = null,
 
     pub fn init(playdate: *pdapi.PlaydateAPI, allocator: *PlaydateAllocator) !*App {
         const body_font = playdate.graphics.loadFont("/System/Fonts/Roobert-20-Medium.pft", null) orelse return error.FontLoadFailed;
+        const newsleak_serif_font = playdate.graphics.loadFont("assets/fonts/Newsleak-Serif.pft", null) orelse return error.FontLoadFailed;
         const app = try allocator.allocator().create(App);
         app.playdate = playdate;
         app.allocator = allocator;
-        app.renderer = PlaydateRenderer.init(playdate, body_font);
+        app.renderer = PlaydateRenderer.init(playdate, body_font, newsleak_serif_font);
         app.opening_file = null;
         app.chapter_file = null;
         app.prefetch_file = null;
+        app.progress_file = null;
         app.telemetry_menu = null;
         app.coordinator.initInPlace(reader_coordinator.default_checkpoint_byte_budget);
         app.coordinator.attachAllocator(allocator.allocator());
         app.coordinator.attachPersistence(persistence.Service.init(playdate_persistence.fileStore(playdate.file)));
         app.coordinator.attachHost(app.readerHost());
         app.coordinator.loadSettings();
+        app.renderer.selectFont(app.coordinator.font);
         app.installSystemMenu();
         app.discoverLibrary();
         return app;
@@ -50,18 +55,28 @@ pub const App = struct {
             self.coordinator.frameFinished(started_at, self.playdate.system.getCurrentTimeMilliseconds());
         }
 
+        var current: pdapi.PDButtons = 0;
         var pushed: pdapi.PDButtons = 0;
-        self.playdate.system.getButtonState(null, &pushed, null);
+        self.playdate.system.getButtonState(&current, &pushed, null);
         self.coordinator.update(.{
             .buttons = buttonsFromPlaydate(pushed),
+            .a_held = current & pdapi.BUTTON_A != 0,
             .crank_change = self.playdate.system.getCrankChange(),
             .crank_docked = self.playdate.system.isCrankDocked() != 0,
         }, started_at);
 
-        self.renderer.beginFrame();
+        self.renderer.beginFrame(self.coordinator.theme, self.coordinator.font);
         self.renderer.draw(self.coordinator.renderModel());
         if (self.coordinator.telemetrySnapshot()) |snapshot| self.renderer.drawTelemetry(snapshot, self.allocator.stats);
         return 1;
+    }
+
+    pub fn handleSystemEvent(self: *App, event: pdapi.PDSystemEvent) void {
+        switch (event) {
+            .EventLock, .EventPause, .EventTerminate, .EventLowPower => self.coordinator.systemPaused(self.playdate.system.getCurrentTimeMilliseconds()),
+            .EventUnlock, .EventResume => self.coordinator.systemResumed(),
+            else => {},
+        }
     }
 
     fn discoverLibrary(self: *App) void {
@@ -100,11 +115,13 @@ fn openReaderFile(context: *anyopaque, slot: reader_host.FileSlot, path: [:0]con
         .opening => app.opening_file = opened,
         .chapter => app.chapter_file = opened,
         .prefetch => app.prefetch_file = opened,
+        .progress => app.progress_file = opened,
     }
     return switch (slot) {
         .opening => if (app.opening_file) |*file| file.reader() else unreachable,
         .chapter => if (app.chapter_file) |*file| file.reader() else unreachable,
         .prefetch => if (app.prefetch_file) |*file| file.reader() else unreachable,
+        .progress => if (app.progress_file) |*file| file.reader() else unreachable,
     };
 }
 
@@ -119,6 +136,10 @@ fn closeReaderFile(context: *anyopaque, slot: reader_host.FileSlot) void {
         .prefetch => {
             if (app.prefetch_file) |*file| file.close();
             app.prefetch_file = null;
+        },
+        .progress => {
+            if (app.progress_file) |*file| file.close();
+            app.progress_file = null;
         },
     }
 }

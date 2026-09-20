@@ -8,6 +8,8 @@ pub const Limits = struct {
     forward_chapter_bytes_per_update: usize = 256,
     reconstruction_bytes_per_update: usize = 2 * 1024,
     prefetch_bytes_per_update: usize = 1024,
+    progress_index_bytes_per_update: usize = 512,
+    progress_directory_records_per_update: usize = 8,
     metadata_read_chunk_bytes: usize = 1024,
     max_container_document_bytes: usize = 1024,
     max_package_document_bytes: usize = 64 * 1024,
@@ -29,5 +31,7 @@ test "resource policy preserves required stream and DEFLATE bounds" {
     try std.testing.expectEqual(@as(usize, 256), reader.forward_chapter_bytes_per_update);
     try std.testing.expectEqual(@as(usize, 2 * 1024), reader.reconstruction_bytes_per_update);
     try std.testing.expect(reader.reconstruction_bytes_per_update > reader.forward_chapter_bytes_per_update);
+    try std.testing.expectEqual(@as(usize, 512), reader.progress_index_bytes_per_update);
+    try std.testing.expect(reader.progress_directory_records_per_update <= reader.max_archive_entries);
     try std.testing.expect(reader.max_xml_entity_bytes <= reader.max_xml_tag_bytes);
 }

@@ -2,13 +2,21 @@ const std = @import("std");
 const reading_position = @import("resume.zig");
 const reading_state = @import("reading_state.zig");
 const reading_pace = @import("pace.zig");
+const reading_progress = @import("progress.zig");
 const reader_settings = @import("settings.zig");
 const write_schedule = @import("write_schedule.zig");
 
 pub const ReadingSnapshot = reading_state.ReadingSnapshot;
 pub const RestoredPosition = reading_state.RestoredPosition;
 pub const Settings = reader_settings.Settings;
+pub const Theme = reader_settings.Theme;
+pub const Font = reader_settings.Font;
+pub const ProgressVisibility = reader_settings.ProgressVisibility;
+pub const ProgressPosition = reader_settings.ProgressPosition;
+pub const ProgressScope = reader_settings.ProgressScope;
 pub const Pace = reading_pace.Stats;
+pub const ProgressKey = reading_progress.Key;
+pub const ProgressIndex = reading_progress.Index;
 pub const WriteKind = write_schedule.Kind;
 
 /// The only persistence I/O contract required by reader code. Platform
@@ -18,6 +26,7 @@ pub const FileStore = struct {
     context: *anyopaque,
     read: *const fn (context: *anyopaque, name: []const u8, output: []u8) bool,
     write: *const fn (context: *anyopaque, name: []const u8, input: []const u8) bool,
+    delete: *const fn (context: *anyopaque, name: []const u8) bool,
 };
 
 pub const Service = struct {
@@ -60,6 +69,13 @@ pub const Service = struct {
         return self.files.write(self.files.context, filename, &bytes);
     }
 
+    pub fn deletePosition(self: *Service, book_id: u32) bool {
+        self.schedule.clear(.position);
+        var name: [24]u8 = undefined;
+        const filename = positionFilename(&name, book_id) orelse return false;
+        return self.files.delete(self.files.context, filename);
+    }
+
     pub fn loadPace(self: *Service, book_id: u32) Pace {
         self.schedule.clear(.pace);
         var name: [24]u8 = undefined;
@@ -75,6 +91,23 @@ pub const Service = struct {
         const filename = paceFilename(&name, pace.book_id) orelse return false;
         var bytes: [reading_pace.encoded_size]u8 = undefined;
         reading_pace.encode(pace, &bytes);
+        return self.files.write(self.files.context, filename, &bytes);
+    }
+
+    pub fn loadProgress(self: *Service, key: ProgressKey) ?ProgressIndex {
+        self.schedule.clear(.progress);
+        var name: [24]u8 = undefined;
+        const filename = progressFilename(&name, key.book_id) orelse return null;
+        var bytes: [reading_progress.encoded_size]u8 = undefined;
+        if (!self.files.read(self.files.context, filename, &bytes)) return null;
+        return reading_progress.decode(&bytes, key) catch null;
+    }
+
+    pub fn saveProgress(self: *const Service, index: ProgressIndex) bool {
+        var name: [24]u8 = undefined;
+        const filename = progressFilename(&name, index.key.book_id) orelse return false;
+        var bytes: [reading_progress.encoded_size]u8 = undefined;
+        reading_progress.encode(index, &bytes) catch return false;
         return self.files.write(self.files.context, filename, &bytes);
     }
 
@@ -123,6 +156,22 @@ pub const Service = struct {
         self.completeWrite(.pace);
         return true;
     }
+
+    /// Partial progress indexes retain their request after an I/O failure so
+    /// verified chapter counts are retried without rescanning content.
+    pub fn flushProgressIfDue(self: *Service, index: ProgressIndex) bool {
+        if (!self.writeDue(.progress)) return false;
+        if (!self.saveProgress(index)) return false;
+        self.completeWrite(.progress);
+        return true;
+    }
+
+    pub fn flushPendingProgress(self: *Service, index: ProgressIndex) bool {
+        if (!self.writePending(.progress)) return false;
+        if (!self.saveProgress(index)) return false;
+        self.completeWrite(.progress);
+        return true;
+    }
 };
 
 const settings_filename = "settings.bin";
@@ -133,6 +182,10 @@ fn positionFilename(buffer: []u8, book_id: u32) ?[]const u8 {
 
 fn paceFilename(buffer: []u8, book_id: u32) ?[]const u8 {
     return std.fmt.bufPrint(buffer, "pace-{x}.bin", .{book_id}) catch null;
+}
+
+fn progressFilename(buffer: []u8, book_id: u32) ?[]const u8 {
+    return std.fmt.bufPrint(buffer, "progress-{x}.bin", .{book_id}) catch null;
 }
 
 test "a service saves and restores an isolated book snapshot" {
@@ -152,6 +205,24 @@ test "a service saves and restores an isolated book snapshot" {
     try std.testing.expect(service.loadPosition(8, 2) == null);
 }
 
+test "deleting a position clears its pending write and saved resume" {
+    var files = MemoryFiles{};
+    var service = Service.init(files.port());
+    const snapshot = ReadingSnapshot{
+        .book_id = 7,
+        .layout_revision = 2,
+        .chapter = 3,
+        .word_ordinal = 42,
+        .mode = .paged,
+    };
+
+    try std.testing.expect(service.savePosition(snapshot));
+    service.requestWrite(.position, 10);
+    try std.testing.expect(service.deletePosition(7));
+    try std.testing.expect(!service.writePending(.position));
+    try std.testing.expect(service.loadPosition(7, 2) == null);
+}
+
 test "a failed due pace write stays pending until it can be persisted" {
     var files = MemoryFiles{ .fail_writes = true };
     var service = Service.init(files.port());
@@ -168,19 +239,44 @@ test "a failed due pace write stays pending until it can be persisted" {
 test "settings persist independently of per-book records" {
     var files = MemoryFiles{};
     var service = Service.init(files.port());
-    try std.testing.expect(service.saveSettings(.{ .reading_mode = .rsvp, .rsvp_wpm = 425 }));
-    try std.testing.expectEqual(Settings{ .reading_mode = .rsvp, .rsvp_wpm = 425 }, service.loadSettings());
+    try std.testing.expect(service.saveSettings(.{ .reading_mode = .rsvp, .rsvp_wpm = 425, .theme = .dark, .font = .newsleak_serif }));
+    try std.testing.expectEqual(Settings{ .reading_mode = .rsvp, .rsvp_wpm = 425, .theme = .dark, .font = .newsleak_serif }, service.loadSettings());
+}
+
+test "progress indexes persist by book identity and retry failed writes" {
+    var files = MemoryFiles{};
+    var service = Service.init(files.port());
+    const key = ProgressKey{
+        .book_id = 7,
+        .publication_fingerprint = [_]u8{0xa5} ** 16,
+        .word_semantics_revision = 1,
+        .spine_len = 2,
+    };
+    var index = reading_progress.Index.init(key) catch unreachable;
+    index.setExact(0, 42) catch unreachable;
+
+    service.requestWrite(.progress, 0);
+    files.fail_writes = true;
+    try std.testing.expect(!service.flushProgressIfDue(index));
+    try std.testing.expect(service.writePending(.progress));
+    files.fail_writes = false;
+    try std.testing.expect(service.flushProgressIfDue(index));
+    try std.testing.expect(!service.writePending(.progress));
+
+    const restored = service.loadProgress(key) orelse return error.TestExpectedEqual;
+    try std.testing.expect(restored.exact.contains(0));
+    try std.testing.expectEqual(@as(u32, 42), restored.chapter_words[0]);
 }
 
 const MemoryFiles = struct {
     name: [32]u8 = undefined,
     name_len: usize = 0,
-    bytes: [16]u8 = undefined,
+    bytes: [reading_progress.encoded_size]u8 = undefined,
     bytes_len: usize = 0,
     fail_writes: bool = false,
 
     fn port(self: *MemoryFiles) FileStore {
-        return .{ .context = self, .read = read, .write = write };
+        return .{ .context = self, .read = read, .write = write, .delete = delete };
     }
 
     fn read(context: *anyopaque, name: []const u8, output: []u8) bool {
@@ -198,6 +294,14 @@ const MemoryFiles = struct {
         @memcpy(self.bytes[0..input.len], input);
         self.name_len = name.len;
         self.bytes_len = input.len;
+        return true;
+    }
+
+    fn delete(context: *anyopaque, name: []const u8) bool {
+        const self: *MemoryFiles = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, name, self.name[0..self.name_len])) return false;
+        self.name_len = 0;
+        self.bytes_len = 0;
         return true;
     }
 };

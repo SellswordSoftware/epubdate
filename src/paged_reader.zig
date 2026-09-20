@@ -60,6 +60,7 @@ pub const PagedReader = struct {
         selected_word_ordinal: ?u32,
         page_index: u32,
         waiting_for_page: bool,
+        reconstructing: bool,
     };
 
     pages: [page_capacity]pagination.PageCache = [_]pagination.PageCache{.{}} ** page_capacity,
@@ -175,10 +176,13 @@ pub const PagedReader = struct {
     /// internals to determine whether a page is drawable.
     pub fn renderState(self: *const PagedReader) RenderState {
         return .{
-            .page = self.current(),
+            // Reconstruction advances through real pages internally, but none
+            // is the requested destination until the semantic target resolves.
+            .page = if (self.reconstructing) null else self.current(),
             .selected_word_ordinal = self.selected_word_ordinal,
             .page_index = self.page_index,
             .waiting_for_page = !self.current_ready or self.pending_selection != null,
+            .reconstructing = self.reconstructing,
         };
     }
 
@@ -194,6 +198,10 @@ pub const PagedReader = struct {
 
     pub fn finishInput(self: *PagedReader) anyerror!void {
         try self.extractor.?.finish();
+    }
+
+    pub fn wordCount(self: *const PagedReader) u32 {
+        return if (self.builder) |builder| builder.wordCount() else 0;
     }
 
     /// Takes prefetched tokenizer state while rebinding its events to this
@@ -410,6 +418,15 @@ pub const PagedReader = struct {
                 self.reconstructing = false;
                 return true;
             },
+        }
+        // A saved ordinal can become unreachable when the EPUB at the same
+        // path is replaced or edited. At verified EOF, land on the last valid
+        // word instead of leaving the restoration barrier up forever.
+        if (self.reconstructing and self.chapter_end and page.word_count != 0) {
+            self.selected_word_ordinal = page.first_word_ordinal + page.word_count - 1;
+            self.pending_selection = null;
+            self.reconstructing = false;
+            return true;
         }
         return false;
     }
@@ -743,6 +760,24 @@ test "render state exposes only drawable page data and semantic selection" {
     try std.testing.expect(render.page != null);
     try std.testing.expectEqual(@as(?u32, 7), render.selected_word_ordinal);
     try std.testing.expect(!render.waiting_for_page);
+
+    reader.beginWordRescan(7);
+    const restoring = reader.renderState();
+    try std.testing.expect(restoring.page == null);
+    try std.testing.expect(restoring.reconstructing);
+}
+
+test "word restoration clamps a stale ordinal at verified chapter end" {
+    var reader = PagedReader.init(3 * @sizeOf(cache_policy.Entry));
+    reader.current_ready = true;
+    reader.chapter_end = true;
+    reader.pages[0] = makePage(10, 2);
+    reader.beginWordRescan(99);
+
+    try std.testing.expect(reader.fulfillPendingSelection());
+    try std.testing.expectEqual(@as(?u32, 11), reader.selected_word_ordinal);
+    try std.testing.expect(!reader.isReconstructing());
+    try std.testing.expect(reader.renderState().page != null);
 }
 
 test "bounded decoded input stays in the engine tokenizer and page builder" {

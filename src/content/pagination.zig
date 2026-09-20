@@ -136,6 +136,10 @@ pub const EventPageBuilder = struct {
         };
     }
 
+    pub fn wordCount(self: *const EventPageBuilder) u32 {
+        return self.word_ordinals.count();
+    }
+
     pub fn consume(self: *EventPageBuilder, event: xhtml.Event) error{ PageFull, LineTooLong }!void {
         if (self.page_full) return error.PageFull;
         switch (event) {
