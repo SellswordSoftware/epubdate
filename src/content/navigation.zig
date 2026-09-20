@@ -28,13 +28,13 @@ pub const State = struct {
     }
 
     /// Advances while browsing pages behind the parked forward stream. Returns
-    /// the requested cache page, or null when the caller may resume streaming.
+    /// the requested cache page, including the stream-front page that resumes
+    /// normal streaming, or null when history browsing is not active.
     pub fn forwardFromCache(self: *State) ?u32 {
         if (!self.viewing_cached_history) return null;
         self.page += 1;
         if (self.page == self.stream_front) {
             self.viewing_cached_history = false;
-            return null;
         }
         return self.page;
     }
@@ -46,16 +46,6 @@ pub const State = struct {
     }
 };
 
-/// The shared history slot has a different meaning while browsing backward:
-/// normally it holds the immediately previous page, but during cached-history
-/// navigation it holds the page immediately ahead of the current page.
-pub fn canRestoreSharedPage(current_page: u32, requested_page: u32, browsing_cached_history: bool) bool {
-    return if (browsing_cached_history)
-        requested_page == current_page + 1
-    else
-        current_page != 0 and requested_page + 1 == current_page;
-}
-
 test "cached back and forward rejoin the parked stream" {
     var navigation = State{};
     navigation.opened(0);
@@ -63,7 +53,7 @@ test "cached back and forward rejoin the parked stream" {
     navigation.advancedStream();
     try std.testing.expectEqual(@as(?u32, 1), navigation.beginCachedBack());
     try std.testing.expectEqual(@as(u32, 1), navigation.page);
-    try std.testing.expectEqual(@as(?u32, null), navigation.forwardFromCache());
+    try std.testing.expectEqual(@as(?u32, 2), navigation.forwardFromCache());
     try std.testing.expectEqual(@as(u32, 2), navigation.page);
     try std.testing.expect(!navigation.viewing_cached_history);
 }
@@ -75,7 +65,7 @@ test "multiple cached backs retain the original stream front" {
     try std.testing.expectEqual(@as(?u32, 1), navigation.beginCachedBack());
     try std.testing.expectEqual(@as(u32, 3), navigation.stream_front);
     try std.testing.expectEqual(@as(?u32, 2), navigation.forwardFromCache());
-    try std.testing.expectEqual(@as(?u32, null), navigation.forwardFromCache());
+    try std.testing.expectEqual(@as(?u32, 3), navigation.forwardFromCache());
 }
 
 test "rescan becomes the new stream front" {
@@ -85,12 +75,4 @@ test "rescan becomes the new stream front" {
     try std.testing.expectEqual(@as(u32, 3), navigation.page);
     try std.testing.expectEqual(@as(u32, 3), navigation.stream_front);
     try std.testing.expect(!navigation.viewing_cached_history);
-}
-
-test "shared history does not mistake a forward page for a second backward page" {
-    // After p → p-1, the sole history slot holds p. A request for p-2 must
-    // miss and schedule a rescan instead of swapping p back onto the screen.
-    try std.testing.expect(!canRestoreSharedPage(4, 3, true));
-    try std.testing.expect(canRestoreSharedPage(4, 5, true));
-    try std.testing.expect(canRestoreSharedPage(4, 3, false));
 }

@@ -2,8 +2,8 @@ const std = @import("std");
 const xhtml = @import("xhtml.zig");
 const word_index = @import("word_index.zig");
 
-/// One displayed word is the only input-derived text RSVP retains.  A later
-/// backward seek rebuilds this position by replaying the chapter stream.
+/// Each retained RSVP slot owns bounded text. The reader decides how many
+/// slots form its in-memory history window.
 pub const max_word_bytes = 384;
 pub const default_wpm: u16 = 300;
 pub const min_wpm: u16 = 100;

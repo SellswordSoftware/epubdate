@@ -4,6 +4,8 @@ const zip = @import("archive/zip.zig");
 const pagination = @import("content/pagination.zig");
 const xhtml = @import("content/xhtml.zig");
 
+pub const PageSlot = u8;
+
 /// Bounded preparation of one next-chapter page. File opening and central
 /// directory lookup are deliberately outside this type; after an entry is
 /// selected, all decoding and page-construction state belongs here.
@@ -11,14 +13,14 @@ pub const Session = struct {
     pub const State = union(enum) {
         idle,
         looking_up: struct { chapter: u8, scanner: zip.ArchiveScanner, finder: ?zip.EntryFinder = null },
-        decoding: struct { chapter: u8, page: u2 },
-        ready: struct { chapter: u8, page: u2, ended: bool },
+        decoding: struct { chapter: u8, page: PageSlot },
+        ready: struct { chapter: u8, page: PageSlot, ended: bool },
         active,
         failed,
     };
 
     pub const Step = enum { working, ready, failed };
-    pub const Activation = struct { chapter: u8, page: u2, ended: bool };
+    pub const Activation = struct { chapter: u8, page: PageSlot, ended: bool };
     pub const FileLease = struct {
         context: *anyopaque,
         close: *const fn (context: *anyopaque) void,
@@ -89,7 +91,7 @@ pub const Session = struct {
         archive: zip.Archive,
         entry: zip.Entry,
         chapter: u8,
-        page_slot: u2,
+        page_slot: PageSlot,
         page: *pagination.PageCache,
         compressed_input: []u8,
         window: []u8,
@@ -226,7 +228,7 @@ pub const Session = struct {
         };
     }
 
-    pub fn readyPage(self: *const Session) ?u2 {
+    pub fn readyPage(self: *const Session) ?PageSlot {
         return switch (self.state) {
             .ready => |ready| ready.page,
             else => null,
@@ -275,7 +277,7 @@ test "activation preserves the prepared first page and makes cancellation harmle
     session.output_end = 8;
     const activation = session.activate().?;
     try std.testing.expectEqual(@as(u8, 3), activation.chapter);
-    try std.testing.expectEqual(@as(u2, 2), activation.page);
+    try std.testing.expectEqual(@as(PageSlot, 2), activation.page);
     try std.testing.expect(!activation.ended);
     session.cancel();
     try std.testing.expectEqual(Session.State.active, session.state);

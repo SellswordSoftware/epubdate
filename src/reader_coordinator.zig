@@ -5,6 +5,9 @@ const library_storage = @import("storage/library.zig");
 const reading_pace = @import("storage/pace.zig");
 const paged_reader = @import("paged_reader.zig");
 const rsvp_reader = @import("rsvp_reader.zig");
+const pagination = @import("content/pagination.zig");
+const rsvp = @import("content/rsvp.zig");
+const cache_policy = @import("content/cache_policy.zig");
 const decode_workspace = @import("decode_workspace.zig");
 const opening_session = @import("opening_session.zig");
 const persistence = @import("storage/persistence.zig");
@@ -14,6 +17,27 @@ const deflate = @import("archive/deflate.zig");
 const limits = @import("limits").reader;
 const telemetry = @import("telemetry.zig");
 const reader_host = @import("reader_host.zig");
+const reader_transitions = @import("reader_transitions.zig");
+const reader_layout = @import("reader_layout.zig");
+
+const prefetch_directory_records_per_step: usize = 8;
+const layout_revision: u16 = 1;
+const resume_debounce_frames: u8 = 60;
+const pace_debounce_frames: u8 = 60;
+const crank_degrees_per_word: f32 = 15;
+pub const default_checkpoint_byte_budget = cache_policy.capacity * @sizeOf(cache_policy.Entry);
+pub const page_pool_reserved_bytes = paged_reader.PagedReader.page_pool_reserved_bytes;
+pub const word_pool_reserved_bytes = rsvp_reader.RsvpReader.word_pool_reserved_bytes;
+pub const reader_cache_reserved_bytes = page_pool_reserved_bytes + word_pool_reserved_bytes;
+
+fn paginationMeasure(measure: reader_host.TextMeasure) pagination.Measure {
+    const font_height = if (measure.font_height) |height| height(measure.context) else 20;
+    return .{
+        .context = measure.context,
+        .width = measure.width,
+        .line_limit = reader_layout.pageLineLimit(font_height, pagination.max_lines),
+    };
+}
 
 /// Platform-independent vocabulary at the boundary between the Playdate
 /// façade and reader behavior. ZIP, XHTML, persistence, and graphics handles
@@ -31,21 +55,6 @@ pub const Screen = enum {
 
 pub const ReadingMode = enum { paged, rsvp };
 pub const Readiness = enum { opening, ready, chapter_error };
-pub const IntentPort = struct {
-    context: *anyopaque,
-    cancel_active_reading: *const fn (context: *anyopaque) void,
-    perform: *const fn (context: *anyopaque, intent: input.Intent, now_ms: u32) void,
-};
-
-pub const WorkPort = struct {
-    context: *anyopaque,
-    advance_opening: *const fn (context: *anyopaque) void,
-    advance_chapter: *const fn (context: *anyopaque) void,
-    fulfill_paged_selection: *const fn (context: *anyopaque) void,
-    drain_paged_detents: *const fn (context: *anyopaque) void,
-    advance_prefetch: *const fn (context: *anyopaque) void,
-    flush_persistence: *const fn (context: *anyopaque) void,
-};
 pub const Lifecycle = enum {
     opening,
     ready,
@@ -72,6 +81,21 @@ pub const ChapterOpenJob = struct {
     finder: ?zip.EntryFinder = null,
 };
 
+pub const ChapterStep = struct {
+    worked: bool = false,
+    position_changed: bool = false,
+    request_prefetch: bool = false,
+};
+
+pub const FrameInput = struct {
+    buttons: input.Buttons = .{},
+    crank_change: f32 = 0,
+    crank_docked: bool = false,
+};
+
+pub const SystemAction = enum { library, settings, chapters };
+const PagedSelectionMove = enum { advanced, waiting_for_page, at_limit };
+
 /// Owns UI lifecycle transitions. Reader engines report readiness and semantic
 /// navigation; the coordinator owns which screen is currently active.
 pub const ReaderCoordinator = struct {
@@ -85,7 +109,7 @@ pub const ReaderCoordinator = struct {
     pending_mode_word_ordinal: ?u32 = null,
     chapter_browser: chapter_browser.Model = .{},
     paged: paged_reader.PagedReader,
-    rsvp_reader: rsvp_reader.RsvpReader = .{},
+    rsvp_reader: rsvp_reader.RsvpReader,
     decode_workspace: decode_workspace.DecodeWorkspace = .{},
     opening_job: ?opening_session.Session = null,
     /// A successful opener asks the platform façade to begin this chapter.
@@ -94,6 +118,8 @@ pub const ReaderCoordinator = struct {
     opening_chapter_request: ?u8 = null,
     persistence: ?persistence.Service = null,
     chapter_open: ?ChapterOpenJob = null,
+    chapter_lease_open: bool = false,
+    active_prefetch_lease: bool = false,
     chapter_index: u8 = 0,
     chapter_end: bool = false,
     pending_prefetch_transition: ?u8 = null,
@@ -102,8 +128,8 @@ pub const ReaderCoordinator = struct {
     zip_entries: [epub.max_manifest_items]zip.IndexedEntry = undefined,
     archive_index: ?zip.DirectoryIndex = null,
     publication: epub.Publication = undefined,
-    prefetch_scan_buffer: [1024]u8 = undefined,
-    prefetch_filename_buffer: [limits.max_archive_filename_bytes]u8 = undefined,
+    archive_scan_buffer: [1024]u8 = undefined,
+    archive_filename_buffer: [limits.max_archive_filename_bytes]u8 = undefined,
     deflate_input_buffer: [limits.compressed_input_bytes]u8 = undefined,
     deflate_window: [32 * 1024]u8 = undefined,
     deflate_workspace: deflate.Workspace = undefined,
@@ -115,12 +141,13 @@ pub const ReaderCoordinator = struct {
     chapter_output_end: usize = 0,
     telemetry: telemetry.Telemetry = .{},
     crank_accumulated: f32 = 0,
+    crank_docked: bool = false,
     host: ?reader_host.ReaderHost = null,
     allocator: ?std.mem.Allocator = null,
 
     /// Initializes this large, heap-resident state directly in place.  Do not
-    /// return it by value: that creates a roughly 125 KiB temporary on the
-    /// Playdate's small callback stack.
+    /// return it by value: that creates a large temporary on the Playdate's
+    /// small callback stack.
     pub fn initInPlace(self: *ReaderCoordinator, checkpoint_byte_budget: usize) void {
         self.* = undefined;
         self.screen = .library;
@@ -133,12 +160,14 @@ pub const ReaderCoordinator = struct {
         self.pending_mode_word_ordinal = null;
         self.chapter_browser = .{};
         self.paged.initInPlace(checkpoint_byte_budget);
-        self.rsvp_reader = .{};
+        self.rsvp_reader.initInPlace();
         self.decode_workspace = .{};
         self.opening_job = null;
         self.opening_chapter_request = null;
         self.persistence = null;
         self.chapter_open = null;
+        self.chapter_lease_open = false;
+        self.active_prefetch_lease = false;
         self.chapter_index = 0;
         self.chapter_end = false;
         self.pending_prefetch_transition = null;
@@ -150,6 +179,7 @@ pub const ReaderCoordinator = struct {
         self.chapter_output_end = 0;
         self.telemetry = .{};
         self.crank_accumulated = 0;
+        self.crank_docked = false;
         self.host = null;
         self.allocator = null;
     }
@@ -183,12 +213,112 @@ pub const ReaderCoordinator = struct {
         self.persistence = service;
     }
 
+    pub fn loadSettings(self: *ReaderCoordinator) void {
+        const settings = self.persistence.?.loadSettings();
+        self.mode = if (settings.reading_mode == .rsvp) .rsvp else .paged;
+        self.rsvp_reader.wpm = settings.rsvp_wpm;
+    }
+
+    pub fn saveSettings(self: *ReaderCoordinator) void {
+        _ = self.persistence.?.saveSettings(.{
+            .reading_mode = if (self.mode == .rsvp) .rsvp else .paged,
+            .rsvp_wpm = self.rsvp_reader.wpm,
+        });
+    }
+
+    pub fn requestPositionSave(self: *ReaderCoordinator) void {
+        if (self.lifecycle == .ready) self.persistence.?.requestWrite(.position, resume_debounce_frames);
+    }
+
+    pub fn requestPaceSave(self: *ReaderCoordinator) void {
+        self.persistence.?.requestWrite(.pace, pace_debounce_frames);
+    }
+
+    pub fn flushPersistence(self: *ReaderCoordinator) void {
+        if (self.persistence) |*service| {
+            if (self.lifecycle == .ready) _ = service.flushPositionIfDue(self.positionSnapshot());
+            _ = service.flushPaceIfDue(self.pace);
+        }
+    }
+
+    pub fn flushPositionNow(self: *ReaderCoordinator) void {
+        if (self.persistence) |*service| _ = service.flushPositionNow(self.positionSnapshot());
+    }
+
+    pub fn flushPaceNow(self: *ReaderCoordinator) void {
+        if (self.persistence) |*service| _ = service.flushPendingPace(self.pace);
+    }
+
+    pub fn restorePosition(self: *ReaderCoordinator) void {
+        if (self.lifecycle != .ready) return;
+        const service = &(self.persistence orelse return);
+        const restored = service.loadPosition(self.bookIdentity(), layout_revision) orelse return;
+        switch (restored) {
+            .legacy_paged_page => |legacy| {
+                if (legacy.chapter >= self.publication.spine_len) return;
+                const chapter: u8 = @intCast(legacy.chapter);
+                if (self.mode == .paged) self.openChapter(chapter, if (legacy.page == 0) .normal else .{ .rescan = legacy.page }) else self.openChapter(chapter, .normal);
+            },
+            .snapshot => |snapshot| {
+                if (snapshot.chapter >= self.publication.spine_len) return;
+                const chapter: u8 = @intCast(snapshot.chapter);
+                self.pending_mode_word_ordinal = snapshot.word_ordinal;
+                switch (self.mode) {
+                    .paged => {
+                        self.paged.pending_selection = .{ .ordinal = snapshot.word_ordinal };
+                        self.openChapter(chapter, .{ .word_rescan = snapshot.word_ordinal });
+                    },
+                    .rsvp => self.openChapter(chapter, .{ .rsvp_rescan = .{ .word = snapshot.word_ordinal } }),
+                }
+            },
+        }
+    }
+
+    pub fn positionSnapshot(self: *const ReaderCoordinator) persistence.ReadingSnapshot {
+        return .{
+            .book_id = self.bookIdentity(),
+            .layout_revision = layout_revision,
+            .chapter = self.chapter_index,
+            .word_ordinal = self.pending_mode_word_ordinal orelse if (self.mode == .rsvp) self.rsvp_reader.position().word else self.currentPagedWordOrdinal(),
+            .mode = if (self.mode == .rsvp) .rsvp else .paged,
+        };
+    }
+
+    fn currentPagedWordOrdinal(self: *const ReaderCoordinator) u32 {
+        const page = self.paged.current() orelse return self.paged.selected_word_ordinal orelse 0;
+        return page.moveSelection(self.paged.selected_word_ordinal, 0) orelse 0;
+    }
+
+    fn bookIdentity(self: *const ReaderCoordinator) u32 {
+        return persistence.Service.bookIdentity(self.active_book.slice());
+    }
+
     pub fn beginOpening(self: *ReaderCoordinator) void {
         self.screen = .opening;
     }
 
     pub fn returnToLibrary(self: *ReaderCoordinator) void {
         self.screen = .library;
+    }
+
+    /// Performs the complete semantic exit from a book. Stable platform file
+    /// handles are released through ReaderHost slot callbacks.
+    pub fn leaveBook(self: *ReaderCoordinator, now_ms: u32) void {
+        self.rsvp_reader.stopAutoplay(now_ms, &self.pace);
+        self.flushPaceNow();
+        if (self.lifecycle == .ready) self.flushPositionNow();
+        self.cancelOpening();
+        self.cancelPrefetch();
+        self.cancelChapter();
+        self.paged.builder = null;
+        self.archive_index = null;
+        self.paged.rescan = .none;
+        self.paged.pending_selection = null;
+        self.pending_mode_word_ordinal = null;
+        self.pending_prefetch_transition = null;
+        self.paged.detent_backlog = 0;
+        self.returnToLibrary();
+        self.lifecycle = .opening;
     }
 
     pub fn openSettings(self: *ReaderCoordinator) bool {
@@ -446,9 +576,13 @@ pub const ReaderCoordinator = struct {
             .opened => {},
             .failed => unreachable,
         }
-        job.releaseFileLease();
-        if (self.allocator) |allocator| job.cancel(allocator);
+        if (self.allocator) |allocator| {
+            job.cancel(allocator);
+        } else {
+            job.closeFileLease();
+        }
         self.opening_job = null;
+        self.archive_index = null;
         self.lifecycle = .ready;
         self.beginReading();
         self.chapter_index = 0;
@@ -475,6 +609,408 @@ pub const ReaderCoordinator = struct {
         }
         self.opening_job = null;
         self.opening_chapter_request = null;
+    }
+
+    /// Begins a bounded chapter open through the stable chapter host slot.
+    /// Replacing a request first releases the prior stream and its lease.
+    pub fn openChapter(self: *ReaderCoordinator, index: u8, action: ChapterOpenAction) void {
+        self.pending_prefetch_transition = null;
+        self.cancelPrefetch();
+        self.cancelChapter();
+        self.chapter_open = .{ .index = index, .action = action };
+        self.paged.builder = null;
+        self.paged.current_ready = false;
+        self.paged.next_ready = false;
+        self.paged.selected_word_ordinal = null;
+        self.chapter_end = false;
+        self.paged.chapter_end = false;
+    }
+
+    /// Advances one bounded chapter-open or stream step. Later migration
+    /// stages consume the returned save/prefetch requests in the coordinator.
+    pub fn stepChapter(self: *ReaderCoordinator, now_ms: u32) ChapterStep {
+        const job = &(self.chapter_open orelse return self.stepChapterStream(now_ms));
+        if (job.scanner == null) {
+            const files = self.host.?.files orelse {
+                self.failChapter(.archive);
+                return .{ .worked = true };
+            };
+            const reader = files.open(files.context, .chapter, self.active_book.zSlice()) catch {
+                self.failChapter(.archive);
+                return .{ .worked = true };
+            };
+            self.chapter_lease_open = true;
+            job.scanner = zip.ArchiveScanner.init(reader) catch {
+                self.failChapter(.archive);
+                return .{ .worked = true };
+            };
+            return .{ .worked = true };
+        }
+        if (job.finder == null) {
+            const archive = job.scanner.?.step(&self.archive_scan_buffer) catch {
+                self.failChapter(.archive);
+                return .{ .worked = true };
+            } orelse return .{ .worked = true };
+            if (job.index >= self.publication.spine_len) {
+                self.failChapter(.archive);
+                return .{ .worked = true };
+            }
+            job.finder = zip.EntryFinder.init(archive, self.publication.spine[job.index].slice());
+            return .{ .worked = true };
+        }
+        const entry = job.finder.?.step(&self.archive_filename_buffer) catch {
+            self.failChapter(.archive);
+            return .{ .worked = true };
+        } orelse {
+            if (job.finder.?.entry_index == job.finder.?.archive.entry_count) self.failChapter(.archive);
+            return .{ .worked = true };
+        };
+        const archive = job.finder.?.archive;
+        const index = job.index;
+        const action = job.action;
+        self.chapter_open = null;
+        self.beginOpenedChapter(archive, index, entry, now_ms) catch {
+            self.failChapter(.archive);
+            return .{ .worked = true };
+        };
+        switch (action) {
+            .normal => {},
+            .rescan => |target| self.paged.beginRescan(target),
+            .word_rescan => |target| self.paged.beginWordRescan(target),
+            .rsvp_rescan => |target| self.rsvp_reader.reconstruct(target),
+            .rescan_to_last_page => self.paged.beginRescanToLastPage(),
+        }
+        return .{ .worked = true };
+    }
+
+    fn stepChapterStream(self: *ReaderCoordinator, now_ms: u32) ChapterStep {
+        if (self.lifecycle != .ready or self.paged.next_ready or self.chapter_end or self.chapter_stream == null) return .{};
+        if (self.mode == .rsvp and self.rsvp_reader.hasWord()) return .{};
+
+        const reconstructing = self.chapterIsReconstructing();
+        var budget = self.chapterWorkBudget();
+        while (budget != 0 and !self.paged.next_ready and !self.chapter_end) {
+            if (self.chapter_output_start != self.chapter_output_end) {
+                const available = self.chapter_output[self.chapter_output_start..self.chapter_output_end];
+                const input_bytes = available[0..if (self.mode == .rsvp) 1 else @min(available.len, budget)];
+                const progress = (if (self.mode == .rsvp) self.rsvp_reader.feed(input_bytes) else self.paged.feed(input_bytes)) catch {
+                    self.failChapter(.tokenizer);
+                    return .{ .worked = true };
+                };
+                var page_completed = false;
+                const consumed = switch (progress) {
+                    .consumed => |count| count,
+                    .page_full => |count| blk: {
+                        self.pageCompleted(now_ms);
+                        page_completed = true;
+                        break :blk count;
+                    },
+                };
+                self.chapter_output_start += consumed;
+                budget -= consumed;
+                if (reconstructing and page_completed) return .{ .worked = true };
+                if (self.mode == .rsvp and self.rsvp_reader.hasWord()) {
+                    self.telemetry.setChapterEvents(self.rsvp_reader.event_count);
+                    if (self.pending_mode_word_ordinal == self.rsvp_reader.position().word) self.pending_mode_word_ordinal = null;
+                    self.rsvp_reader.wordBecameDrawable(now_ms);
+                    return .{ .worked = true, .position_changed = true };
+                }
+                continue;
+            }
+
+            const stream = &self.chapter_stream.?;
+            const output = self.chapter_output[0..@min(self.chapter_output.len, budget)];
+            const result = stream.read(output) catch {
+                self.failChapter(.archive);
+                return .{ .worked = true };
+            };
+            switch (result) {
+                .bytes => |count| {
+                    self.telemetry.decodedBytes(count);
+                    self.chapter_output_start = 0;
+                    self.chapter_output_end = count;
+                },
+                .end => {
+                    if (self.mode != .rsvp) self.paged.finishInput() catch {
+                        self.failChapter(.tokenizer);
+                        return .{ .worked = true };
+                    };
+                    if (self.mode == .rsvp) {
+                        self.rsvp_reader.finishInput() catch {
+                            self.failChapter(.tokenizer);
+                            return .{ .worked = true };
+                        };
+                        self.chapter_end = true;
+                        stream.finish() catch {
+                            self.failChapter(.archive);
+                            return .{ .worked = true };
+                        };
+                        self.telemetry.setChapterEvents(self.rsvp_reader.event_count);
+                        var position_changed = false;
+                        if (self.rsvp_reader.hasWord()) {
+                            if (self.pending_mode_word_ordinal == self.rsvp_reader.position().word) self.pending_mode_word_ordinal = null;
+                            self.rsvp_reader.wordBecameDrawable(now_ms);
+                            position_changed = true;
+                        }
+                        if (self.rsvp_reader.targetUnresolved()) {
+                            self.failChapter(.page_limit);
+                        } else if (!self.rsvp_reader.hasWord()) {
+                            if (self.nextReadableChapter()) |next| {
+                                self.openChapter(next, .normal);
+                            } else self.failChapter(.no_supported_text);
+                        }
+                        return .{ .worked = true, .position_changed = position_changed };
+                    }
+                    self.paged.builderPtr().?.end() catch |err| {
+                        if (err == error.PageFull) self.pageCompleted(now_ms) else self.failChapter(.page_limit);
+                        return .{ .worked = true };
+                    };
+                    self.chapter_end = true;
+                    self.paged.chapter_end = true;
+                    if (self.paged.finishChapter() == .at_limit) {
+                        self.failChapter(.page_limit);
+                        return .{ .worked = true };
+                    }
+                    stream.finish() catch {
+                        self.failChapter(.archive);
+                        return .{ .worked = true };
+                    };
+                    self.decode_workspace.markActiveVerifiedEof();
+                    if (!self.paged.isRescanning() and !self.paged.current_ready and !self.paged.next_ready) {
+                        if (self.nextReadableChapter()) |next| {
+                            self.openChapter(next, .normal);
+                        } else self.failChapter(.no_supported_text);
+                        return .{ .worked = true };
+                    }
+                    return .{ .worked = true, .request_prefetch = !self.paged.isRescanning() };
+                },
+                .needs_input => {
+                    self.failChapter(.archive);
+                    return .{ .worked = true };
+                },
+            }
+        }
+        return .{ .worked = true };
+    }
+
+    fn chapterIsReconstructing(self: *const ReaderCoordinator) bool {
+        return switch (self.mode) {
+            .paged => self.paged.isReconstructing(),
+            .rsvp => self.rsvp_reader.isReconstructing(),
+        };
+    }
+
+    fn chapterWorkBudget(self: *const ReaderCoordinator) usize {
+        return if (self.chapterIsReconstructing()) limits.reconstruction_bytes_per_update else limits.forward_chapter_bytes_per_update;
+    }
+
+    fn pageCompleted(self: *ReaderCoordinator, now_ms: u32) void {
+        self.telemetry.pageCompleted(now_ms);
+        self.paged.pageCompleted(self.telemetry.chapter_events, self.paged.sourceOffset());
+    }
+
+    fn nextReadableChapter(self: *const ReaderCoordinator) ?u8 {
+        return if (self.chapter_index + 1 < self.publication.spine_len) self.chapter_index + 1 else null;
+    }
+
+    fn beginOpenedChapter(self: *ReaderCoordinator, archive: zip.Archive, index: u8, entry: zip.Entry, now_ms: u32) !void {
+        if (self.decode_workspace.beginActive() != .acquired) return error.DecodeWorkspaceBusy;
+        self.chapter_storage = zip.StreamStorage.init(&self.deflate_input_buffer, &self.deflate_window, &self.deflate_workspace);
+        self.chapter_stream = archive.begin(entry, &self.chapter_storage) catch |err| {
+            self.decode_workspace.release(.active);
+            return err;
+        };
+        self.chapter_index = index;
+        const measure = self.host.?.measure;
+        self.paged.begin(index, reader_layout.text_width, paginationMeasure(measure));
+        self.chapter_end = false;
+        self.chapter_output_start = 0;
+        self.chapter_output_end = 0;
+        self.telemetry.chapterStarted(now_ms);
+        if (self.mode == .rsvp) {
+            self.paged.builder = null;
+            self.paged.extractor = null;
+            self.rsvp_reader.begin(index);
+        }
+    }
+
+    /// Cancels chapter lookup/decoding and releases its stable host slot once.
+    pub fn cancelChapter(self: *ReaderCoordinator) void {
+        self.chapter_open = null;
+        self.chapter_stream = null;
+        if (self.decode_workspace.owner == .active) self.decode_workspace.release(.active);
+        self.releaseChapterLease();
+    }
+
+    /// Releases the stable chapter file after its stream reached verified
+    /// EOF. Prefetch may then lease the shared decode workspace safely.
+    pub fn releaseChapterLease(self: *ReaderCoordinator) void {
+        if (!self.chapter_lease_open) return;
+        if (self.host) |host| if (host.files) |files| files.close(files.context, .chapter);
+        self.chapter_lease_open = false;
+    }
+
+    /// Starts bounded preparation of the next chapter only after the active
+    /// decoder has reached verified EOF and yielded the shared workspace.
+    pub fn startPrefetch(self: *ReaderCoordinator) bool {
+        if (!self.paged.next_ready or self.chapter_index + 1 >= self.publication.spine_len or self.paged.prefetch.isPrefetching()) return false;
+        if (self.decode_workspace.beginPrefetch() != .acquired) return false;
+        self.releaseActivePrefetch();
+        self.releaseChapterLease();
+        const files = self.host.?.files orelse {
+            self.decode_workspace.release(.prefetch);
+            return false;
+        };
+        const reader = files.open(files.context, .prefetch, self.active_book.zSlice()) catch {
+            self.decode_workspace.release(.prefetch);
+            return false;
+        };
+        self.paged.prefetch.attachFile(.{ .context = self, .close = closePrefetchHostLease });
+        self.paged.prefetch.startLookup(self.chapter_index + 1, reader) catch {
+            self.cancelPrefetch();
+            return false;
+        };
+        return true;
+    }
+
+    pub fn cancelPrefetch(self: *ReaderCoordinator) void {
+        if (self.paged.prefetch.state == .active) {
+            self.releaseActivePrefetch();
+            return;
+        }
+        self.paged.prefetch.cancel();
+        self.paged.releasePrefetchPage();
+        if (self.decode_workspace.owner == .prefetch) self.decode_workspace.release(.prefetch);
+    }
+
+    /// Advances bounded central-directory lookup or one bounded decode step.
+    /// Failure is recoverable; a waiting boundary request falls back to a
+    /// normal chapter open through the typed chapter slot.
+    pub fn stepPrefetch(self: *ReaderCoordinator) void {
+        if (self.paged.prefetch.state == .looking_up) {
+            const next = self.chapter_index + 1;
+            if (next >= self.publication.spine_len) {
+                self.cancelPrefetch();
+                self.openPendingPrefetchTransition();
+                return;
+            }
+            switch (self.paged.prefetch.stepLookup(&self.archive_scan_buffer, &self.archive_filename_buffer, self.publication.spine[next].slice(), prefetch_directory_records_per_step)) {
+                .working => return,
+                .missing, .failed => {
+                    self.cancelPrefetch();
+                    self.openPendingPrefetchTransition();
+                    return;
+                },
+                .found => |found| {
+                    const reserved = self.paged.reservePrefetchPage(found.chapter) orelse {
+                        self.cancelPrefetch();
+                        self.openPendingPrefetchTransition();
+                        return;
+                    };
+                    const measure = self.host.?.measure;
+                    self.paged.prefetch.begin(
+                        found.archive,
+                        found.entry,
+                        found.chapter,
+                        reserved.slot,
+                        reserved.page,
+                        &self.deflate_input_buffer,
+                        &self.deflate_window,
+                        &self.deflate_workspace,
+                        reader_layout.text_width,
+                        paginationMeasure(measure),
+                    ) catch {
+                        self.cancelPrefetch();
+                        self.openPendingPrefetchTransition();
+                        return;
+                    };
+                },
+            }
+        }
+        if (!self.paged.prefetch.isPrefetching()) return;
+        switch (self.paged.prefetch.step(&self.chapter_output, limits.prefetch_bytes_per_update)) {
+            .working => {},
+            .ready => {
+                if (self.pending_prefetch_transition != null) _ = self.activatePrefetch();
+            },
+            .failed => {
+                self.cancelPrefetch();
+                self.openPendingPrefetchTransition();
+            },
+        }
+    }
+
+    pub fn prefetchedChapter(self: *const ReaderCoordinator) ?u8 {
+        return self.paged.prefetch.readyChapter();
+    }
+
+    /// Resolves the semantic next-chapter boundary against prepared,
+    /// in-flight, or absent prefetch state.
+    pub fn requestNextChapter(self: *ReaderCoordinator) void {
+        if (self.chapter_index + 1 >= self.publication.spine_len) return;
+        const next = self.chapter_index + 1;
+        if (self.paged.prefetch.isReady()) {
+            _ = self.activatePrefetch();
+        } else if (self.paged.prefetch.isPrefetching()) {
+            self.pending_prefetch_transition = next;
+        } else {
+            self.openChapter(next, .normal);
+        }
+    }
+
+    pub fn requestedChapter(self: *const ReaderCoordinator) ?u8 {
+        return if (self.chapter_open) |job| job.index else null;
+    }
+
+    /// Promotes a prepared page and its retained stream without copying the
+    /// platform file handle whose address backs the ZIP reader.
+    pub fn activatePrefetch(self: *ReaderCoordinator) bool {
+        const prepared = self.paged.prefetch.activate() orelse return false;
+        self.pending_prefetch_transition = null;
+        self.decode_workspace.activatePrefetch();
+        self.releaseChapterLease();
+        self.paged.prefetch.detachFile();
+        self.active_prefetch_lease = true;
+        self.chapter_stream = self.paged.prefetch.stream;
+        self.paged.builder = self.paged.prefetch.builder;
+        self.paged.adoptExtractor(self.paged.prefetch.extractor.?);
+        self.chapter_output_start = self.paged.prefetch.output_start;
+        self.chapter_output_end = self.paged.prefetch.output_end;
+        self.chapter_index = prepared.chapter;
+        self.paged.activatePrefetchedPage(prepared.page, prepared.chapter, prepared.ended);
+        self.chapter_end = prepared.ended;
+        self.paged.recordCheckpoint(0, self.telemetry.chapter_events, self.paged.sourceOffset());
+        if (prepared.ended) self.decode_workspace.markActiveVerifiedEof();
+        return true;
+    }
+
+    fn openPendingPrefetchTransition(self: *ReaderCoordinator) void {
+        const index = self.pending_prefetch_transition orelse return;
+        self.pending_prefetch_transition = null;
+        if (index < self.publication.spine_len and index == self.chapter_index + 1) self.openChapter(index, .normal);
+    }
+
+    fn releaseActivePrefetch(self: *ReaderCoordinator) void {
+        if (self.paged.prefetch.state != .active) return;
+        if (self.active_prefetch_lease) {
+            if (self.host) |host| if (host.files) |files| files.close(files.context, .prefetch);
+            self.active_prefetch_lease = false;
+        }
+        self.paged.prefetch.releaseActive();
+        if (self.decode_workspace.owner == .active) self.decode_workspace.release(.active);
+    }
+
+    pub fn activeChapter(self: *const ReaderCoordinator) ?u8 {
+        return if (self.chapter_stream != null and self.chapter_open == null) self.chapter_index else null;
+    }
+
+    fn failChapter(self: *ReaderCoordinator, failure: ChapterFailure) void {
+        self.chapter_failure = failure;
+        self.paged.current_ready = false;
+        self.paged.next_ready = false;
+        self.chapter_end = true;
+        self.lifecycle = .chapter_error;
+        self.cancelChapter();
     }
 
     fn beginMetadataRead(self: *ReaderCoordinator, job: *opening_session.Session, entry: zip.Entry, target: opening_session.MetadataTarget) zip.Error!void {
@@ -522,76 +1058,323 @@ pub const ReaderCoordinator = struct {
         self.lifecycle = failure;
     }
 
-    /// Applies the screen-level portion of an input event. The returned
-    /// intent is deliberately semantic: App executes only the operation that
-    /// requires Playdate files, clocks, or a reader engine.
-    pub fn handle(self: *ReaderCoordinator, snapshot: InputSnapshot) input.Intent {
-        const intent = intentFor(snapshot);
-        self.applyIntent(intent);
-        return intent;
+    /// Owns one complete reader frame: intent selection, crank/autoplay,
+    /// bounded workflows, and due persistence. Time and input are plain data;
+    /// all platform I/O remains behind ReaderHost.
+    pub fn update(self: *ReaderCoordinator, frame: FrameInput, now_ms: u32) void {
+        self.updateCrankDockState(frame.crank_docked);
+        const intent = intentFor(.{
+            .screen = self.screen,
+            .readiness = if (self.lifecycle == .chapter_error) .chapter_error else if (self.lifecycle == .opening) .opening else .ready,
+            .mode = self.mode,
+            .buttons = frame.buttons,
+        });
+        self.performIntent(intent, now_ms);
+        self.handleCrank(frame.crank_change);
+        self.advanceAutoplay(now_ms);
+
+        self.advanceOpening();
+        if (self.takeOpeningChapterRequest()) |chapter| {
+            self.openChapter(chapter, .normal);
+            self.restorePosition();
+        }
+        const chapter = self.stepChapter(now_ms);
+        if (chapter.position_changed) self.requestPositionSave();
+        if (chapter.request_prefetch) _ = self.startPrefetch();
+        self.fulfillPendingPagedSelection();
+        if (self.mode == .paged and !self.crank_docked) self.drainPagedDetents();
+        self.stepPrefetch();
+        self.flushPersistence();
     }
 
-    fn applyIntent(self: *ReaderCoordinator, intent: input.Intent) void {
-        switch (intent) {
-            .open_selected_book => self.beginOpening(),
-            .return_to_library => self.returnToLibrary(),
-            .close_settings => _ = self.closeSettings(),
-            .open_browser_chapter => self.beginReading(),
-            .close_chapter_browser => _ = self.closeChapterBrowser(),
-            else => {},
+    pub fn handleSystemAction(self: *ReaderCoordinator, action: SystemAction, now_ms: u32) void {
+        switch (action) {
+            .library => self.leaveBook(now_ms),
+            .settings => _ = self.openSettings(),
+            .chapters => {
+                if (self.screen != .reading or self.publication.spine_len == 0) return;
+                self.rsvp_reader.stopAutoplay(now_ms, &self.pace);
+                self.crank_accumulated = 0;
+                _ = self.openChapters(self.publication.spine_len, self.chapter_index);
+            },
         }
     }
 
-    /// The coordinator owns intent selection and lifecycle transitions. A
-    /// narrow adapter executes only intents requiring platform I/O or an
-    /// engine operation.
-    pub fn update(self: *ReaderCoordinator, snapshot: InputSnapshot, now_ms: u32, port: IntentPort) void {
-        const intent = intentFor(snapshot);
-        if (intent == .return_to_library) self.cancelAndReturn(port);
-        self.applyIntent(intent);
-        if (intent != .none and intent != .return_to_library) port.perform(port.context, intent, now_ms);
+    fn performIntent(self: *ReaderCoordinator, intent: input.Intent, now_ms: u32) void {
+        switch (intent) {
+            .none => {},
+            .library_next => self.library.move(1),
+            .library_previous => self.library.move(-1),
+            .open_selected_book => _ = self.openSelectedBook(),
+            .return_to_library => self.leaveBook(now_ms),
+            .close_settings => _ = self.closeSettings(),
+            .close_chapter_browser => {
+                _ = self.closeChapterBrowser();
+                self.crank_accumulated = 0;
+            },
+            .chapter_browser_next => self.chapter_browser.move(1),
+            .chapter_browser_previous => self.chapter_browser.move(-1),
+            .open_browser_chapter => {
+                if (self.chapter_browser.entry_count == 0) return;
+                const selected = self.chapter_browser.selected;
+                self.crank_accumulated = 0;
+                self.beginReading();
+                self.openChapter(selected, .normal);
+                self.lifecycle = .ready;
+            },
+            .settings_next => self.moveSettingsSelection(1),
+            .settings_previous => self.moveSettingsSelection(-1),
+            .activate_setting => if (self.settings_selected == 0) self.switchReadingMode(now_ms) else {
+                _ = self.rsvp_reader.adjustWpm(1, now_ms, &self.pace);
+                self.saveSettings();
+            },
+            .toggle_reading_mode => self.switchReadingMode(now_ms),
+            .rsvp_toggle_autoplay => if (self.screen == .reading and self.mode == .rsvp) self.rsvp_reader.toggleAutoplay(now_ms, &self.pace),
+            .rsvp_wpm_up => self.adjustRsvpWpm(1, now_ms),
+            .rsvp_wpm_down => self.adjustRsvpWpm(-1, now_ms),
+            .rsvp_previous_sentence => self.previousRsvpSentence(now_ms),
+            .next_page => {
+                self.paged.pending_selection = null;
+                if (self.lifecycle == .ready and self.chapter_open == null) {
+                    self.handlePagedMove(self.paged.nextPage());
+                    self.requestPositionSave();
+                }
+            },
+            .previous_page => {
+                self.paged.pending_selection = null;
+                if (self.lifecycle == .ready and self.chapter_open == null) self.handlePagedMove(self.paged.previousPage());
+            },
+            .next_chapter => self.openAdjacentChapter(1),
+            .previous_chapter => self.openAdjacentChapter(-1),
+        }
     }
 
-    /// System-menu Library uses this directly; input-driven return uses the
-    /// same operation before its lifecycle transition.
-    pub fn cancelAndReturn(self: *ReaderCoordinator, port: IntentPort) void {
-        port.cancel_active_reading(port.context);
-        self.returnToLibrary();
+    fn switchReadingMode(self: *ReaderCoordinator, now_ms: u32) void {
+        const target_word = if (self.mode == .paged)
+            reader_transitions.pagedModeSwitchOrdinal(self.currentPagedWordOrdinal(), self.paged.pending_selection)
+        else
+            self.rsvp_reader.position().word;
+        self.toggleMode();
+        self.rsvp_reader.stopAutoplay(now_ms, &self.pace);
+        self.paged.pending_selection = null;
+        self.paged.detent_backlog = 0;
+        self.crank_accumulated = 0;
+        self.pending_mode_word_ordinal = target_word;
+        if (self.lifecycle == .ready) {
+            switch (self.mode) {
+                .paged => {
+                    self.paged.pending_selection = .{ .ordinal = target_word };
+                    self.openChapter(self.chapter_index, .{ .word_rescan = target_word });
+                },
+                .rsvp => self.openChapter(self.chapter_index, .{ .rsvp_rescan = .{ .word = target_word } }),
+            }
+            self.requestPositionSave();
+        }
+        self.saveSettings();
     }
 
-    /// Fixed bounded-work ordering for one reader frame. The platform adapter
-    /// supplies file and clock operations; the coordinator owns their order.
-    pub fn advanceWork(self: *ReaderCoordinator, port: WorkPort) void {
-        port.advance_opening(port.context);
-        port.advance_chapter(port.context);
-        port.fulfill_paged_selection(port.context);
-        if (self.mode == .paged) port.drain_paged_detents(port.context);
-        port.advance_prefetch(port.context);
-        port.flush_persistence(port.context);
+    fn adjustRsvpWpm(self: *ReaderCoordinator, direction: i8, now_ms: u32) void {
+        if (self.screen != .reading or self.mode != .rsvp) return;
+        if (!self.rsvp_reader.adjustWpm(direction, now_ms, &self.pace)) return;
+        self.requestPaceSave();
+        self.saveSettings();
     }
 
-    pub fn renderModel(self: *const ReaderCoordinator) RenderModel {
+    fn advanceAutoplay(self: *ReaderCoordinator, now_ms: u32) void {
+        if (self.screen != .reading or self.mode != .rsvp) return;
+        if (self.rsvp_reader.autoplay(now_ms, &self.pace)) |move| {
+            self.requestPaceSave();
+            self.handleRsvpMove(move);
+        }
+    }
+
+    fn previousRsvpSentence(self: *ReaderCoordinator, now_ms: u32) void {
+        if (self.lifecycle != .ready or self.chapter_open != null) return;
+        self.rsvp_reader.recordAutoplay(now_ms, 0, &self.pace);
+        self.requestPaceSave();
+        self.rsvp_reader.timer.reset(now_ms);
+        self.handleRsvpMove(self.rsvp_reader.previousSentence());
+    }
+
+    fn handleCrank(self: *ReaderCoordinator, change: f32) void {
+        if (self.screen == .chapter_browser) {
+            self.chapter_browser.move(crankDetents(&self.crank_accumulated, change));
+            return;
+        }
+        if (self.crank_docked) return;
+        if (self.screen != .reading or self.lifecycle != .ready or self.chapter_open != null or self.paged.isRescanning()) return;
+        if (self.mode == .rsvp) {
+            if (self.rsvp_reader.timer.running) return;
+            const move = switch (crankDirection(&self.crank_accumulated, change)) {
+                1 => self.rsvp_reader.nextWord(),
+                -1 => self.rsvp_reader.previousWord(),
+                else => return,
+            };
+            self.handleRsvpMove(move);
+            return;
+        }
+        self.paged.detent_backlog = saturatingAddDetents(self.paged.detent_backlog, crankDetents(&self.crank_accumulated, change));
+        self.drainPagedDetents();
+    }
+
+    fn updateCrankDockState(self: *ReaderCoordinator, docked: bool) void {
+        if (self.crank_docked == docked) return;
+        self.crank_docked = docked;
+        self.crank_accumulated = 0;
+        if (docked) self.paged.detent_backlog = 0;
+    }
+
+    fn handlePagedMove(self: *ReaderCoordinator, move: paged_reader.PagedReader.Move) void {
+        switch (move) {
+            .needs_reconstruction => self.openChapter(self.chapter_index, .{ .rescan = self.paged.navigation_state.page }),
+            .needs_previous_chapter => if (self.chapter_index != 0) self.openChapter(self.chapter_index - 1, .rescan_to_last_page),
+            .needs_next_chapter => self.requestNextChapter(),
+            .moved, .waiting, .at_limit => {},
+        }
+    }
+
+    fn drainPagedDetents(self: *ReaderCoordinator) void {
+        while (self.paged.detent_backlog != 0) {
+            if (self.paged.pending_selection != null) return;
+            const direction: i8 = if (self.paged.detent_backlog > 0) 1 else -1;
+            switch (self.movePagedSelection(direction)) {
+                .advanced => self.paged.detent_backlog -= direction,
+                .waiting_for_page => return,
+                .at_limit => {
+                    self.paged.detent_backlog = 0;
+                    return;
+                },
+            }
+        }
+    }
+
+    fn movePagedSelection(self: *ReaderCoordinator, direction: i8) PagedSelectionMove {
+        const move = self.paged.moveSelection(direction, self.chapter_index != 0, self.chapter_index + 1 < self.publication.spine_len);
+        self.handlePagedMove(move);
+        return switch (move) {
+            .moved => blk: {
+                self.fulfillPendingPagedSelection();
+                if (self.paged.pending_selection == null) {
+                    self.requestPositionSave();
+                    break :blk .advanced;
+                }
+                break :blk .waiting_for_page;
+            },
+            .at_limit => .at_limit,
+            .waiting, .needs_reconstruction, .needs_previous_chapter, .needs_next_chapter => .waiting_for_page,
+        };
+    }
+
+    fn fulfillPendingPagedSelection(self: *ReaderCoordinator) void {
+        if (self.mode != .paged or !self.paged.current_ready) return;
+        if (!self.paged.fulfillPendingSelection()) return;
+        if (self.pending_mode_word_ordinal == self.paged.selected_word_ordinal) self.pending_mode_word_ordinal = null;
+        self.requestPositionSave();
+    }
+
+    fn handleRsvpMove(self: *ReaderCoordinator, move: rsvp_reader.RsvpReader.Move) void {
+        switch (move) {
+            .moved => self.requestPositionSave(),
+            .needs_word, .waiting, .at_limit => {},
+            .needs_rescan => |target| self.openChapter(self.chapter_index, .{ .rsvp_rescan = target }),
+            .needs_next_chapter => if (self.nextReadableChapter()) |next| self.openChapter(next, .normal),
+        }
+    }
+
+    fn openAdjacentChapter(self: *ReaderCoordinator, direction: i8) void {
+        const candidate: i16 = @as(i16, self.chapter_index) + direction;
+        if (candidate < 0 or candidate >= self.publication.spine_len) return;
+        self.openChapter(@intCast(candidate), .normal);
+        self.lifecycle = .ready;
+    }
+
+    pub fn renderModel(self: *ReaderCoordinator) RenderModel {
         switch (self.screen) {
-            .library => return .{ .library = .{ .selected = self.library.selected, .entries = self.library.len } },
+            .library => {
+                var paths = [_][]const u8{""} ** library_storage.capacity;
+                for (self.library.books[0..self.library.len], 0..) |*book, index| paths[index] = book.slice();
+                return .{ .library = .{ .paths = paths, .count = self.library.len, .selected = self.library.selected } };
+            },
             .settings => return .{ .settings = .{ .selected = self.settings_selected, .mode = self.mode, .wpm = self.rsvp_reader.wpm } },
-            .chapter_browser => return .{ .chapters = .{ .selected = self.chapter_browser.selected, .entries = self.chapter_browser.entry_count } },
+            .chapter_browser => {
+                var rows = [_]ChapterRowView{.{}} ** chapter_browser.visible_rows;
+                const count = self.chapter_browser.displayedCount();
+                for (0..count) |row_index| {
+                    const index = self.chapter_browser.first_visible + @as(u8, @intCast(row_index));
+                    rows[row_index] = .{
+                        .index = index,
+                        .selected = index == self.chapter_browser.selected,
+                        .label = self.publication.chapter_labels[index].slice(),
+                        .path = self.publication.spine[index].slice(),
+                    };
+                }
+                return .{ .chapters = .{
+                    .selected = self.chapter_browser.selected,
+                    .entries = self.chapter_browser.entry_count,
+                    .rows = rows,
+                    .row_count = count,
+                } };
+            },
             else => {},
         }
         return switch (self.lifecycle) {
             .opening => .opening,
             .ready => switch (self.mode) {
-                .paged => .{ .paged = .{ .page_index = self.paged.page_index, .waiting = self.paged.renderState().waiting_for_page } },
+                .paged => blk: {
+                    const state = self.paged.renderState();
+                    var lines = [_][]const u8{""} ** pagination.max_lines;
+                    var line_count: u8 = 0;
+                    var selected_span: ?pagination.PageCache.WordSpan = null;
+                    if (state.page) |page| {
+                        line_count = page.line_count;
+                        for (0..page.line_count) |index| lines[index] = page.line(index);
+                        if (page.moveSelection(state.selected_word_ordinal, 0)) |selected| {
+                            self.paged.selected_word_ordinal = selected;
+                            if (!self.crank_docked) selected_span = page.wordSpan(selected);
+                        }
+                    }
+                    break :blk .{ .paged = .{
+                        .lines = lines,
+                        .line_count = line_count,
+                        .selected_span = selected_span,
+                        .page_index = state.page_index,
+                        .waiting = state.waiting_for_page,
+                    } };
+                },
                 .rsvp => blk: {
                     const state = self.rsvp_reader.renderState();
-                    break :blk .{ .rsvp = .{ .word = state.word, .waiting = state.waiting, .playing = state.playing, .wpm = state.wpm } };
+                    const anchor = if (state.word) |word| rsvp.anchorBytes(word) else null;
+                    break :blk .{ .rsvp = .{
+                        .word = state.word,
+                        .anchor = if (anchor) |span| .{ .start = span.start, .end = span.end } else null,
+                        .waiting = state.waiting,
+                        .reconstructing = self.rsvp_reader.isReconstructing(),
+                        .playing = state.playing,
+                        .wpm = state.wpm,
+                    } };
                 },
             },
             .unavailable => .{ .failure = .unavailable },
             .invalid_archive => .{ .failure = .invalid_archive },
             .missing_mimetype => .{ .failure = .missing_mimetype },
             .invalid_mimetype => .{ .failure = .invalid_mimetype },
-            .chapter_error => .{ .failure = .chapter },
+            .chapter_error => .{ .failure = .{ .chapter = .{
+                .reason = self.chapter_failure,
+                .path = if (self.chapter_index < self.publication.spine_len) self.publication.spine[self.chapter_index].slice() else null,
+            } } },
         };
+    }
+
+    pub fn frameFinished(self: *ReaderCoordinator, started_at_ms: u32, now_ms: u32) void {
+        self.telemetry.frameFinished(started_at_ms, now_ms);
+    }
+
+    pub fn telemetrySnapshot(self: *const ReaderCoordinator) ?telemetry.Telemetry.Snapshot {
+        return if (self.telemetry.enabled) self.telemetry.snapshot() else null;
+    }
+
+    pub fn setTelemetryEnabled(self: *ReaderCoordinator, enabled: bool) void {
+        self.telemetry.setEnabled(enabled);
     }
 };
 
@@ -599,6 +1382,12 @@ fn closeOpeningHostLease(context: *anyopaque) void {
     const self: *ReaderCoordinator = @ptrCast(@alignCast(context));
     const files = self.host.?.files orelse return;
     files.close(files.context, .opening);
+}
+
+fn closePrefetchHostLease(context: *anyopaque) void {
+    const self: *ReaderCoordinator = @ptrCast(@alignCast(context));
+    const files = self.host.?.files orelse return;
+    files.close(files.context, .prefetch);
 }
 
 pub const InputSnapshot = struct {
@@ -632,19 +1421,101 @@ pub fn intentFor(snapshot: InputSnapshot) input.Intent {
     });
 }
 
+fn crankDirection(accumulated: *f32, change: f32) i8 {
+    accumulated.* += change;
+    if (accumulated.* >= crank_degrees_per_word) {
+        accumulated.* -= crank_degrees_per_word;
+        return 1;
+    }
+    if (accumulated.* <= -crank_degrees_per_word) {
+        accumulated.* += crank_degrees_per_word;
+        return -1;
+    }
+    return 0;
+}
+
+fn crankDetents(accumulated: *f32, change: f32) i16 {
+    accumulated.* += change;
+    var detents: i16 = 0;
+    while (accumulated.* >= crank_degrees_per_word and detents != std.math.maxInt(i16)) {
+        accumulated.* -= crank_degrees_per_word;
+        detents += 1;
+    }
+    while (accumulated.* <= -crank_degrees_per_word and detents != std.math.minInt(i16)) {
+        accumulated.* += crank_degrees_per_word;
+        detents -= 1;
+    }
+    return detents;
+}
+
+fn saturatingAddDetents(existing: i16, incoming: i16) i16 {
+    const total: i32 = @as(i32, existing) + @as(i32, incoming);
+    return @intCast(@max(@as(i32, std.math.minInt(i16)), @min(@as(i32, std.math.maxInt(i16)), total)));
+}
+
 /// Data-only renderer inputs. The drawing adapter is the only layer allowed
 /// to turn them into Playdate graphics calls.
+pub const LibraryView = struct {
+    paths: [library_storage.capacity][]const u8,
+    count: u8,
+    selected: u8,
+};
+
+pub const ChapterRowView = struct {
+    index: u8 = 0,
+    selected: bool = false,
+    label: []const u8 = "",
+    path: []const u8 = "",
+};
+
+pub const ChaptersView = struct {
+    selected: u8,
+    entries: u8,
+    rows: [chapter_browser.visible_rows]ChapterRowView,
+    row_count: u8,
+};
+
+pub const PagedView = struct {
+    lines: [pagination.max_lines][]const u8,
+    line_count: u8,
+    selected_span: ?pagination.PageCache.WordSpan,
+    page_index: u32,
+    waiting: bool,
+};
+
+pub const ByteSpan = struct { start: usize, end: usize };
+
+pub const RsvpView = struct {
+    word: ?[]const u8,
+    anchor: ?ByteSpan = null,
+    waiting: bool,
+    reconstructing: bool = false,
+    playing: bool,
+    wpm: u16,
+};
+
+pub const ChapterErrorView = struct {
+    reason: ChapterFailure,
+    path: ?[]const u8,
+};
+
 pub const RenderModel = union(enum) {
-    library: struct { selected: u8, entries: u8 },
+    library: LibraryView,
     opening,
-    paged: struct { page_index: u32, waiting: bool },
-    rsvp: struct { word: ?[]const u8, waiting: bool, playing: bool, wpm: u16 },
+    paged: PagedView,
+    rsvp: RsvpView,
     settings: struct { selected: u1, mode: ReadingMode, wpm: u16 },
-    chapters: struct { selected: u8, entries: u8 },
+    chapters: ChaptersView,
     failure: ErrorView,
 };
 
-pub const ErrorView = enum { unavailable, invalid_archive, missing_mimetype, invalid_mimetype, chapter };
+pub const ErrorView = union(enum) {
+    unavailable,
+    invalid_archive,
+    missing_mimetype,
+    invalid_mimetype,
+    chapter: ChapterErrorView,
+};
 
 test "coordinator maps platform-free snapshots through existing input priority" {
     try std.testing.expectEqual(input.Intent.toggle_reading_mode, intentFor(.{
@@ -667,6 +1538,35 @@ test "coordinator maps platform-free snapshots through existing input priority" 
     }));
 }
 
+test "docking hides paged focus without discarding its selected word" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.current_page = 0;
+    try coordinator.paged.pages[0].appendLineWithMetadata("one two", 0, 2);
+    coordinator.paged.pages[0].word_count = 2;
+    coordinator.paged.selected_word_ordinal = 1;
+
+    coordinator.paged.detent_backlog = 3;
+    coordinator.crank_accumulated = 7;
+    coordinator.updateCrankDockState(true);
+    try std.testing.expectEqual(@as(i16, 0), coordinator.paged.detent_backlog);
+    try std.testing.expectEqual(@as(f32, 0), coordinator.crank_accumulated);
+    switch (coordinator.renderModel()) {
+        .paged => |view| try std.testing.expect(view.selected_span == null),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(?u32, 1), coordinator.paged.selected_word_ordinal);
+
+    coordinator.updateCrankDockState(false);
+    switch (coordinator.renderModel()) {
+        .paged => |view| try std.testing.expect(view.selected_span != null),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 const MeasurementFake = struct {
     calls: u8 = 0,
 
@@ -684,6 +1584,19 @@ test "coordinator measures text through its typed host" {
     coordinator.attachHost(.{ .measure = .{ .context = &fake, .width = MeasurementFake.width } });
     try std.testing.expectEqual(@as(usize, 7), coordinator.measureText("EPUB"));
     try std.testing.expectEqual(@as(u8, 1), fake.calls);
+}
+
+test "coordinator raises only semantic reconstruction work to the reconstruction ceiling" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    try std.testing.expectEqual(limits.forward_chapter_bytes_per_update, coordinator.chapterWorkBudget());
+
+    coordinator.paged.beginWordRescan(12);
+    try std.testing.expectEqual(limits.reconstruction_bytes_per_update, coordinator.chapterWorkBudget());
+
+    coordinator.mode = .rsvp;
+    coordinator.rsvp_reader.reconstruct(.{ .word = 12 });
+    try std.testing.expectEqual(limits.reconstruction_bytes_per_update, coordinator.chapterWorkBudget());
 }
 
 const LibraryHostFake = struct {
@@ -1037,110 +1950,6 @@ test "coordinator owns screen lifecycle without reader or platform state" {
     try std.testing.expectEqual(Screen.library, coordinator.screen);
 }
 
-test "coordinator applies input-driven lifecycle transitions before dispatch" {
-    var coordinator: ReaderCoordinator = undefined;
-    coordinator.initInPlace(128);
-    try std.testing.expectEqual(input.Intent.open_selected_book, coordinator.handle(.{
-        .screen = coordinator.screen,
-        .readiness = .ready,
-        .mode = .paged,
-        .buttons = .{ .a = true },
-    }));
-    try std.testing.expectEqual(Screen.opening, coordinator.screen);
-    coordinator.beginReading();
-    try std.testing.expect(coordinator.openChapterBrowser());
-    try std.testing.expectEqual(input.Intent.close_chapter_browser, coordinator.handle(.{
-        .screen = coordinator.screen,
-        .readiness = .ready,
-        .mode = .paged,
-        .buttons = .{ .b = true },
-    }));
-    try std.testing.expectEqual(Screen.reading, coordinator.screen);
-}
-
-const RecordedIntent = struct {
-    intent: input.Intent = .none,
-    now_ms: u32 = 0,
-    cancelled: bool = false,
-
-    fn cancel(context: *anyopaque) void {
-        const self: *RecordedIntent = @ptrCast(@alignCast(context));
-        self.cancelled = true;
-    }
-
-    fn perform(context: *anyopaque, intent: input.Intent, now_ms: u32) void {
-        const self: *RecordedIntent = @ptrCast(@alignCast(context));
-        self.intent = intent;
-        self.now_ms = now_ms;
-    }
-};
-
-test "coordinator dispatches through a narrow fake port" {
-    var coordinator: ReaderCoordinator = undefined;
-    coordinator.initInPlace(128);
-    var recorded = RecordedIntent{};
-    coordinator.update(.{
-        .screen = .library,
-        .readiness = .ready,
-        .mode = .paged,
-        .buttons = .{ .a = true },
-    }, 123, .{ .context = &recorded, .cancel_active_reading = RecordedIntent.cancel, .perform = RecordedIntent.perform });
-    try std.testing.expectEqual(input.Intent.open_selected_book, recorded.intent);
-    try std.testing.expectEqual(@as(u32, 123), recorded.now_ms);
-    try std.testing.expectEqual(Screen.opening, coordinator.screen);
-}
-
-test "library return cancels through the port before lifecycle transition" {
-    var coordinator: ReaderCoordinator = undefined;
-    coordinator.initInPlace(128);
-    coordinator.beginReading();
-    var recorded = RecordedIntent{};
-    coordinator.cancelAndReturn(.{ .context = &recorded, .cancel_active_reading = RecordedIntent.cancel, .perform = RecordedIntent.perform });
-    try std.testing.expect(recorded.cancelled);
-    try std.testing.expectEqual(Screen.library, coordinator.screen);
-}
-
-const WorkTrace = struct {
-    calls: [6]u8 = undefined,
-    len: usize = 0,
-
-    fn push(self: *WorkTrace, value: u8) void {
-        self.calls[self.len] = value;
-        self.len += 1;
-    }
-    fn opening(context: *anyopaque) void {
-        (@as(*WorkTrace, @ptrCast(@alignCast(context)))).push(1);
-    }
-    fn chapter(context: *anyopaque) void {
-        (@as(*WorkTrace, @ptrCast(@alignCast(context)))).push(2);
-    }
-    fn selection(context: *anyopaque) void {
-        (@as(*WorkTrace, @ptrCast(@alignCast(context)))).push(3);
-    }
-    fn detents(context: *anyopaque) void {
-        (@as(*WorkTrace, @ptrCast(@alignCast(context)))).push(4);
-    }
-    fn prefetch(context: *anyopaque) void {
-        (@as(*WorkTrace, @ptrCast(@alignCast(context)))).push(5);
-    }
-    fn persistence(context: *anyopaque) void {
-        (@as(*WorkTrace, @ptrCast(@alignCast(context)))).push(6);
-    }
-};
-
-test "coordinator orders bounded work and skips paged-only detents for RSVP" {
-    var coordinator: ReaderCoordinator = undefined;
-    coordinator.initInPlace(128);
-    var trace = WorkTrace{};
-    const port = WorkPort{ .context = &trace, .advance_opening = WorkTrace.opening, .advance_chapter = WorkTrace.chapter, .fulfill_paged_selection = WorkTrace.selection, .drain_paged_detents = WorkTrace.detents, .advance_prefetch = WorkTrace.prefetch, .flush_persistence = WorkTrace.persistence };
-    coordinator.advanceWork(port);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6 }, trace.calls[0..trace.len]);
-    trace.len = 0;
-    coordinator.mode = .rsvp;
-    coordinator.advanceWork(port);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 5, 6 }, trace.calls[0..trace.len]);
-}
-
 test "coordinator owns mode and settings selection" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
@@ -1167,4 +1976,271 @@ test "coordinator retains bounded library and chapter-browser navigation state" 
     try std.testing.expect(coordinator.openChapters(3, 1));
     coordinator.chapter_browser.move(1);
     try std.testing.expectEqual(@as(u8, 2), coordinator.chapter_browser.selected);
+}
+
+const ChapterSlotHostFake = struct {
+    open_calls: u8 = 0,
+    close_calls: u8 = 0,
+    last_slot: ?reader_host.FileSlot = null,
+
+    fn readAt(_: *anyopaque, _: u32, destination: []u8) zip.Error!void {
+        @memset(destination, 0);
+    }
+
+    fn open(context: *anyopaque, slot: reader_host.FileSlot, _: [:0]const u8) reader_host.FileError!zip.Reader {
+        const self: *ChapterSlotHostFake = @ptrCast(@alignCast(context));
+        self.open_calls += 1;
+        self.last_slot = slot;
+        return .{ .context = self, .size = 22, .read_at = readAt };
+    }
+
+    fn close(context: *anyopaque, slot: reader_host.FileSlot) void {
+        const self: *ChapterSlotHostFake = @ptrCast(@alignCast(context));
+        self.close_calls += 1;
+        self.last_slot = slot;
+    }
+
+    fn list(_: *anyopaque, _: *reader_host.Library) void {}
+    fn width(_: *anyopaque, text: []const u8) usize {
+        return text.len;
+    }
+};
+
+const StoredChapterHostFake = struct {
+    const name = "chapter.xhtml";
+    const contents = "<p>Hello chapter</p>";
+    const local_size = 30 + name.len + contents.len;
+    const directory_size = 46 + name.len;
+    const archive_size = local_size + directory_size + 22;
+
+    bytes: [archive_size]u8 = undefined,
+    open_calls: u8 = 0,
+    last_slot: ?reader_host.FileSlot = null,
+
+    fn init() StoredChapterHostFake {
+        var self: StoredChapterHostFake = undefined;
+        @memset(&self.bytes, 0);
+        self.open_calls = 0;
+        self.last_slot = null;
+        const crc = std.hash.crc.Crc32.hash(contents);
+
+        std.mem.writeInt(u32, self.bytes[0..4], 0x0403_4b50, .little);
+        std.mem.writeInt(u16, self.bytes[4..6], 20, .little);
+        std.mem.writeInt(u32, self.bytes[14..18], crc, .little);
+        std.mem.writeInt(u32, self.bytes[18..22], contents.len, .little);
+        std.mem.writeInt(u32, self.bytes[22..26], contents.len, .little);
+        std.mem.writeInt(u16, self.bytes[26..28], name.len, .little);
+        @memcpy(self.bytes[30 .. 30 + name.len], name);
+        @memcpy(self.bytes[30 + name.len .. local_size], contents);
+
+        std.mem.writeInt(u32, self.bytes[local_size..][0..4], 0x0201_4b50, .little);
+        std.mem.writeInt(u16, self.bytes[local_size + 4 ..][0..2], 20, .little);
+        std.mem.writeInt(u16, self.bytes[local_size + 6 ..][0..2], 20, .little);
+        std.mem.writeInt(u32, self.bytes[local_size + 16 ..][0..4], crc, .little);
+        std.mem.writeInt(u32, self.bytes[local_size + 20 ..][0..4], contents.len, .little);
+        std.mem.writeInt(u32, self.bytes[local_size + 24 ..][0..4], contents.len, .little);
+        std.mem.writeInt(u16, self.bytes[local_size + 28 ..][0..2], name.len, .little);
+        @memcpy(self.bytes[local_size + 46 .. local_size + directory_size], name);
+
+        const end = local_size + directory_size;
+        std.mem.writeInt(u32, self.bytes[end..][0..4], 0x0605_4b50, .little);
+        std.mem.writeInt(u16, self.bytes[end + 8 ..][0..2], 1, .little);
+        std.mem.writeInt(u16, self.bytes[end + 10 ..][0..2], 1, .little);
+        std.mem.writeInt(u32, self.bytes[end + 12 ..][0..4], directory_size, .little);
+        std.mem.writeInt(u32, self.bytes[end + 16 ..][0..4], local_size, .little);
+        return self;
+    }
+
+    fn readAt(context: *anyopaque, offset: u32, destination: []u8) zip.Error!void {
+        const self: *StoredChapterHostFake = @ptrCast(@alignCast(context));
+        const start: usize = @intCast(offset);
+        if (start + destination.len > self.bytes.len) return error.UnexpectedEof;
+        @memcpy(destination, self.bytes[start..][0..destination.len]);
+    }
+
+    fn open(context: *anyopaque, slot: reader_host.FileSlot, _: [:0]const u8) reader_host.FileError!zip.Reader {
+        const self: *StoredChapterHostFake = @ptrCast(@alignCast(context));
+        self.open_calls += 1;
+        self.last_slot = slot;
+        return .{ .context = self, .size = archive_size, .read_at = readAt };
+    }
+
+    fn close(_: *anyopaque, _: reader_host.FileSlot) void {}
+    fn list(_: *anyopaque, _: *reader_host.Library) void {}
+    fn width(_: *anyopaque, text: []const u8) usize {
+        return text.len * 8;
+    }
+};
+
+test "chapter work acquires and cancellation releases the typed chapter slot" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    var fake = ChapterSlotHostFake{};
+    coordinator.attachHost(.{
+        .files = .{ .context = &fake, .open = ChapterSlotHostFake.open, .close = ChapterSlotHostFake.close, .list_epubs = ChapterSlotHostFake.list },
+        .measure = .{ .context = &fake, .width = ChapterSlotHostFake.width },
+    });
+    coordinator.library.add("book.epub");
+    _ = coordinator.selectBook();
+
+    coordinator.openChapter(0, .normal);
+    _ = coordinator.stepChapter(10);
+    try std.testing.expectEqual(@as(u8, 1), fake.open_calls);
+    try std.testing.expectEqual(reader_host.FileSlot.chapter, fake.last_slot.?);
+
+    coordinator.cancelChapter();
+    try std.testing.expectEqual(@as(u8, 1), fake.close_calls);
+    coordinator.cancelChapter();
+    try std.testing.expectEqual(@as(u8, 1), fake.close_calls);
+}
+
+test "prefetch acquires its typed slot only after verified chapter EOF and cancels once" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    var fake = ChapterSlotHostFake{};
+    coordinator.attachHost(.{
+        .files = .{ .context = &fake, .open = ChapterSlotHostFake.open, .close = ChapterSlotHostFake.close, .list_epubs = ChapterSlotHostFake.list },
+        .measure = .{ .context = &fake, .width = ChapterSlotHostFake.width },
+    });
+    coordinator.library.add("book.epub");
+    _ = coordinator.selectBook();
+    coordinator.publication.spine_len = 2;
+    coordinator.chapter_index = 0;
+    coordinator.paged.next_ready = true;
+
+    try std.testing.expect(!coordinator.startPrefetch());
+    try std.testing.expectEqual(@as(u8, 0), fake.open_calls);
+
+    _ = coordinator.decode_workspace.beginActive();
+    coordinator.decode_workspace.markActiveVerifiedEof();
+    try std.testing.expect(coordinator.startPrefetch());
+    try std.testing.expectEqual(@as(u8, 1), fake.open_calls);
+    try std.testing.expectEqual(reader_host.FileSlot.prefetch, fake.last_slot.?);
+
+    coordinator.cancelPrefetch();
+    try std.testing.expectEqual(@as(u8, 1), fake.close_calls);
+    coordinator.cancelPrefetch();
+    try std.testing.expectEqual(@as(u8, 1), fake.close_calls);
+}
+
+test "bounded prefetch work prepares and activates the next chapter first page" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    var fake = StoredChapterHostFake.init();
+    coordinator.attachHost(.{
+        .files = .{ .context = &fake, .open = StoredChapterHostFake.open, .close = StoredChapterHostFake.close, .list_epubs = StoredChapterHostFake.list },
+        .measure = .{ .context = &fake, .width = StoredChapterHostFake.width },
+    });
+    coordinator.library.add("book.epub");
+    _ = coordinator.selectBook();
+    @memset(std.mem.asBytes(&coordinator.publication), 0);
+    for (coordinator.publication.spine[0..2]) |*spine| {
+        @memcpy(spine.path[0..StoredChapterHostFake.name.len], StoredChapterHostFake.name);
+        spine.path_len = StoredChapterHostFake.name.len;
+    }
+    coordinator.publication.spine_len = 2;
+    coordinator.chapter_index = 0;
+    coordinator.paged.next_ready = true;
+    coordinator.lifecycle = .ready;
+    coordinator.beginReading();
+    _ = coordinator.decode_workspace.beginActive();
+    coordinator.decode_workspace.markActiveVerifiedEof();
+
+    try std.testing.expect(coordinator.startPrefetch());
+    for (0..32) |_| {
+        coordinator.stepPrefetch();
+        if (coordinator.prefetchedChapter() != null) break;
+    }
+    try std.testing.expectEqual(@as(?u8, 1), coordinator.prefetchedChapter());
+    try std.testing.expectEqual(reader_host.FileSlot.prefetch, fake.last_slot.?);
+    const reserved = coordinator.paged.prefetch_page.?;
+    try std.testing.expectEqual(paged_reader.PagedReader.SlotRole.prefetch, coordinator.paged.slots[reserved].role);
+
+    try std.testing.expect(coordinator.activatePrefetch());
+    try std.testing.expectEqual(@as(?u8, 1), coordinator.activeChapter());
+    try std.testing.expect(coordinator.paged.prefetch_page == null);
+    try std.testing.expectEqual(paged_reader.PagedReader.SlotRole.displayed, coordinator.paged.slots[coordinator.paged.current_page].role);
+    try std.testing.expectEqual(paged_reader.PagedReader.BuildState.idle, coordinator.paged.build);
+    switch (coordinator.renderModel()) {
+        .paged => |view| try std.testing.expect(!view.waiting),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "failed prefetch converts a waiting boundary into a normal chapter request" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    var fake = ChapterSlotHostFake{};
+    coordinator.attachHost(.{
+        .files = .{ .context = &fake, .open = ChapterSlotHostFake.open, .close = ChapterSlotHostFake.close, .list_epubs = ChapterSlotHostFake.list },
+        .measure = .{ .context = &fake, .width = ChapterSlotHostFake.width },
+    });
+    coordinator.library.add("book.epub");
+    _ = coordinator.selectBook();
+    @memset(std.mem.asBytes(&coordinator.publication), 0);
+    coordinator.publication.spine_len = 2;
+    coordinator.chapter_index = 0;
+    coordinator.paged.next_ready = true;
+    _ = coordinator.decode_workspace.beginActive();
+    coordinator.decode_workspace.markActiveVerifiedEof();
+
+    try std.testing.expect(coordinator.startPrefetch());
+    coordinator.requestNextChapter();
+    coordinator.stepPrefetch();
+
+    try std.testing.expectEqual(@as(?u8, 1), coordinator.requestedChapter());
+}
+
+test "bounded chapter work finds the requested spine entry and starts its stream" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    var fake = StoredChapterHostFake.init();
+    coordinator.attachHost(.{
+        .files = .{ .context = &fake, .open = StoredChapterHostFake.open, .close = StoredChapterHostFake.close, .list_epubs = StoredChapterHostFake.list },
+        .measure = .{ .context = &fake, .width = StoredChapterHostFake.width },
+    });
+    coordinator.library.add("book.epub");
+    _ = coordinator.selectBook();
+    @memset(std.mem.asBytes(&coordinator.publication), 0);
+    const path = StoredChapterHostFake.name;
+    @memcpy(coordinator.publication.spine[0].path[0..path.len], path);
+    coordinator.publication.spine[0].path_len = path.len;
+    coordinator.publication.spine_len = 1;
+    coordinator.lifecycle = .ready;
+
+    coordinator.openChapter(0, .normal);
+    for (0..32) |_| {
+        _ = coordinator.stepChapter(20);
+        if (coordinator.activeChapter() != null) break;
+    }
+
+    try std.testing.expectEqual(@as(?u8, 0), coordinator.activeChapter());
+    try std.testing.expectEqual(@as(u8, 1), fake.open_calls);
+}
+
+test "bounded chapter work streams a requested chapter into the paged render view" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    var fake = StoredChapterHostFake.init();
+    coordinator.attachHost(.{
+        .files = .{ .context = &fake, .open = StoredChapterHostFake.open, .close = StoredChapterHostFake.close, .list_epubs = StoredChapterHostFake.list },
+        .measure = .{ .context = &fake, .width = StoredChapterHostFake.width },
+    });
+    coordinator.library.add("book.epub");
+    _ = coordinator.selectBook();
+    @memset(std.mem.asBytes(&coordinator.publication), 0);
+    const path = StoredChapterHostFake.name;
+    @memcpy(coordinator.publication.spine[0].path[0..path.len], path);
+    coordinator.publication.spine[0].path_len = path.len;
+    coordinator.publication.spine_len = 1;
+    coordinator.lifecycle = .ready;
+    coordinator.beginReading();
+
+    coordinator.openChapter(0, .normal);
+    for (0..64) |_| _ = coordinator.stepChapter(20);
+
+    switch (coordinator.renderModel()) {
+        .paged => |view| try std.testing.expect(!view.waiting),
+        else => return error.TestUnexpectedResult,
+    }
 }

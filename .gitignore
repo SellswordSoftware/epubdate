@@ -7,3 +7,4 @@ zig-cache
 .sentry-native
 *.md
 !README.md
+!backward-navigation-plan.md

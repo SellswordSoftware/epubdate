@@ -18,6 +18,7 @@ pub const Files = struct {
 pub const TextMeasure = struct {
     context: *anyopaque,
     width: *const fn (context: *anyopaque, text: []const u8) usize,
+    font_height: ?*const fn (context: *anyopaque) usize = null,
 };
 
 /// The only platform capabilities available to reader orchestration. It holds

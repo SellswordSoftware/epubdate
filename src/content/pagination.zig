@@ -110,6 +110,7 @@ pub const EventPageBuilder = struct {
     cache: *PageCache,
     measure: Measure,
     max_width: usize,
+    line_limit: u8,
     word: [max_cached_line_bytes]u8 = undefined,
     word_len: usize = 0,
     line: [max_cached_line_bytes]u8 = undefined,
@@ -127,7 +128,12 @@ pub const EventPageBuilder = struct {
 
     pub fn init(cache: *PageCache, max_width: usize, measure: Measure) EventPageBuilder {
         cache.clear();
-        return .{ .cache = cache, .measure = measure, .max_width = max_width };
+        return .{
+            .cache = cache,
+            .measure = measure,
+            .max_width = max_width,
+            .line_limit = @max(@as(u8, 1), @min(measure.line_limit, max_lines)),
+        };
     }
 
     pub fn consume(self: *EventPageBuilder, event: xhtml.Event) error{ PageFull, LineTooLong }!void {
@@ -249,6 +255,10 @@ pub const EventPageBuilder = struct {
     }
 
     fn appendLine(self: *EventPageBuilder, text: []const u8) error{ PageFull, LineTooLong }!void {
+        if (self.cache.line_count >= self.line_limit) {
+            self.page_full = true;
+            return error.PageFull;
+        }
         self.cache.appendLineWithMetadata(text, self.line_synthetic_prefix_bytes, @intCast(self.line_source_word_count)) catch |err| switch (err) {
             error.PageFull => {
                 self.page_full = true;
@@ -270,6 +280,7 @@ pub const EventPageBuilder = struct {
 pub const Measure = struct {
     context: *anyopaque,
     width: *const fn (context: *anyopaque, text: []const u8) usize,
+    line_limit: u8 = max_lines,
 };
 
 fn monospaceWidth(_: *anyopaque, text: []const u8) usize {

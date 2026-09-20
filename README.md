@@ -5,7 +5,8 @@ ordinary unencrypted reflowable books from the Playdate data area.
 
 Start with the [product spec](spec.md) for reader behavior and supported EPUB
 features. [The refactor roadmap](refactor.md) explains the architecture work
-that shaped the current code.
+that shaped the current code. The [backward-navigation plan](backward-navigation-plan.md)
+records the fixed-memory reverse-navigation milestone.
 
 ## Build and run
 
@@ -40,10 +41,10 @@ coordinator and reader engines, not in `App` callbacks.
 ## The important owners
 
 - `OpeningSession` owns the EPUB-opening state machine and its temporary work.
-- `PagedReader` owns the three page slots, selection, rescans, checkpoints,
-  and page navigation.
-- `RsvpReader` owns the displayed word, two neighbors, autoplay, and reverse
-  reconstruction targets.
+- `PagedReader` owns the ten-page pool, its eight-page history window,
+  selection, rescans, checkpoints, and page navigation.
+- `RsvpReader` owns the 66-slot word ring, its 64-word reverse window,
+  autoplay, and semantic reconstruction targets.
 - `PrefetchSession` prepares one next-chapter page only after it owns the
   shared decode lease.
 - The persistence service owns record names, validation, debounce scheduling,
@@ -56,7 +57,10 @@ coordinator and reader engines, not in `App` callbacks.
   tiny; do not return or copy large reader structs during startup.
 - Decode only a bounded amount per update. Opening, page builds, rescans, and
   prefetch must yield between steps.
-- Keep exactly three drawable page caches: previous, current, and next.
+- Keep the page pool fixed at ten caches: up to eight history pages, the
+  displayed page, and one building, ready-ahead, or prefetch page.
+- Keep the RSVP pool fixed at 66 word slots, with no more than 64 prior words
+  retained behind the current word.
 - Do not seek inside a DEFLATE stream. Rebuild semantic positions from the
   start of a chapter.
 - There is one reusable decode workspace. Active reading and prefetch must
@@ -85,6 +89,12 @@ Run `zig build test` and `zig build`. For a reader-facing change, smoke test:
 - Paged and RSVP navigation, including a mode switch;
 - returning to the library and reopening the book; and
 - the same flow on hardware.
+
+For cache or reconstruction work, enable **Telemetry** in the system menu
+immediately before the measured interaction. The overlay reports current and
+maximum frame-update milliseconds, page-build timing, allocator live/peak
+bytes, and the fixed reader-cache reservation. Exercise eight reverse Paged
+turns, 64 reverse RSVP words, and the first miss beyond each window.
 
 The product limits, EPUB compatibility details, and known non-features live in
 the [product spec](spec.md).

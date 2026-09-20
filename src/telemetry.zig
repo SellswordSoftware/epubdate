@@ -14,11 +14,23 @@ pub const Telemetry = struct {
     max_page_build_ms: u32 = 0,
 
     pub const Snapshot = struct {
+        update_time_ms: u32,
+        max_update_time_ms: u32,
         chapter_bytes_decoded: u32,
         chapter_events: u32,
         last_page_build_ms: u32,
         max_page_build_ms: u32,
     };
+
+    pub fn setEnabled(self: *Telemetry, enabled: bool) void {
+        if (enabled and !self.enabled) {
+            self.update_time_ms = 0;
+            self.max_update_time_ms = 0;
+            self.last_page_build_ms = 0;
+            self.max_page_build_ms = 0;
+        }
+        self.enabled = enabled;
+    }
 
     pub fn frameFinished(self: *Telemetry, started_at_ms: u32, now_ms: u32) void {
         self.update_time_ms = now_ms -% started_at_ms;
@@ -48,6 +60,8 @@ pub const Telemetry = struct {
 
     pub fn snapshot(self: *const Telemetry) Snapshot {
         return .{
+            .update_time_ms = self.update_time_ms,
+            .max_update_time_ms = self.max_update_time_ms,
             .chapter_bytes_decoded = self.chapter_bytes_decoded,
             .chapter_events = self.chapter_events,
             .last_page_build_ms = self.last_page_build_ms,
@@ -58,6 +72,7 @@ pub const Telemetry = struct {
 
 test "telemetry resets chapter data and retains frame and page high water marks" {
     var telemetry = Telemetry{};
+    telemetry.setEnabled(true);
     telemetry.frameFinished(100, 112);
     telemetry.frameFinished(200, 218);
     telemetry.chapterStarted(300);
@@ -66,8 +81,12 @@ test "telemetry resets chapter data and retains frame and page high water marks"
     telemetry.pageCompleted(325);
     telemetry.pageCompleted(340);
     const snapshot = telemetry.snapshot();
-    try std.testing.expectEqual(@as(u32, 18), telemetry.max_update_time_ms);
+    try std.testing.expectEqual(@as(u32, 18), snapshot.max_update_time_ms);
+    try std.testing.expectEqual(@as(u32, 18), snapshot.update_time_ms);
     try std.testing.expectEqual(@as(u32, 25), snapshot.max_page_build_ms);
     try std.testing.expectEqual(@as(u32, 10), snapshot.chapter_bytes_decoded);
     try std.testing.expectEqual(@as(u32, 4), snapshot.chapter_events);
+    telemetry.setEnabled(false);
+    telemetry.setEnabled(true);
+    try std.testing.expectEqual(@as(u32, 0), telemetry.max_update_time_ms);
 }

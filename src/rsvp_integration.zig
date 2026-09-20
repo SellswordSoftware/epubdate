@@ -5,9 +5,9 @@ const rsvp = @import("content/rsvp.zig");
 const reading_position = @import("storage/resume.zig");
 const settings = @import("storage/settings.zig");
 
-/// Test-only fixture storage. Production RSVP deliberately keeps just the
-/// current word and two neighbors; this fixture records its tiny scripted
-/// chapters so assertions can span the chapter and resume boundaries.
+/// Test-only fixture storage. Production RSVP uses its fixed history ring;
+/// this fixture records tiny scripted chapters so assertions can span the
+/// chapter and resume boundaries.
 const Words = struct {
     text: [8][rsvp.max_word_bytes]u8 = undefined,
     lengths: [8]u16 = [_]u16{0} ** 8,
