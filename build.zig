@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) !void {
         "src/opening_session.zig",
         "src/reader_input.zig",
         "src/reader_transitions.zig",
+        "src/scroll_geometry.zig",
         "src/paged_reader.zig",
         "src/rsvp_reader.zig",
         "src/reader_coordinator.zig",

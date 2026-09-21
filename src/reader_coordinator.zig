@@ -23,6 +23,7 @@ const telemetry = @import("telemetry.zig");
 const reader_host = @import("reader_host.zig");
 const reader_transitions = @import("reader_transitions.zig");
 const reader_layout = @import("reader_layout.zig");
+const scroll_geometry = @import("scroll_geometry.zig");
 
 const prefetch_directory_records_per_step: usize = 8;
 const layout_revision: u16 = 1;
@@ -31,19 +32,37 @@ const pace_debounce_frames: u8 = 60;
 const progress_debounce_frames: u8 = 60;
 const word_semantics_revision: u16 = 1;
 const crank_degrees_per_word: f32 = 15;
+const scroll_millidegrees_per_pixel: i32 = 1_250;
 pub const reset_hold_duration_ms: u16 = 3000;
 pub const default_checkpoint_byte_budget = cache_policy.capacity * @sizeOf(cache_policy.Entry);
 pub const page_pool_reserved_bytes = paged_reader.PagedReader.page_pool_reserved_bytes;
 pub const word_pool_reserved_bytes = rsvp_reader.RsvpReader.word_pool_reserved_bytes;
 pub const reader_cache_reserved_bytes = page_pool_reserved_bytes + word_pool_reserved_bytes;
 
-fn paginationMeasure(measure: reader_host.TextMeasure) pagination.Measure {
-    const font_height = if (measure.font_height) |height| height(measure.context) else 20;
+fn measuredWidth(measure: reader_host.TextMeasure, font: ReadingFont, text: []const u8) usize {
+    if (measure.width_for_font) |width| return width(measure.context, font, text);
+    return measure.width(measure.context, text);
+}
+
+fn measuredFontHeight(measure: reader_host.TextMeasure, font: ReadingFont) usize {
+    if (measure.font_height_for_font) |height| return height(measure.context, font);
+    if (measure.font_height) |height| return height(measure.context);
+    return 20;
+}
+
+fn paginationMeasure(self: *const ReaderCoordinator) pagination.Measure {
+    const measure = self.host.?.measure;
+    const font_height = measuredFontHeight(measure, self.pages_font);
     return .{
-        .context = measure.context,
-        .width = measure.width,
+        .context = @constCast(self),
+        .width = paginationWidth,
         .line_limit = reader_layout.pageLineLimit(font_height, pagination.max_lines),
     };
+}
+
+fn paginationWidth(context: *anyopaque, text: []const u8) usize {
+    const self: *const ReaderCoordinator = @ptrCast(@alignCast(context));
+    return measuredWidth(self.host.?.measure, self.pages_font, text);
 }
 
 /// Platform-independent vocabulary at the boundary between the Playdate
@@ -63,10 +82,11 @@ pub const Screen = enum {
 
 pub const ReadingMode = enum { paged, rsvp };
 pub const Theme = persistence.Theme;
-pub const Font = persistence.Font;
+pub const ReadingFont = persistence.ReadingFont;
 pub const ProgressVisibility = persistence.ProgressVisibility;
 pub const ProgressPosition = persistence.ProgressPosition;
 pub const ProgressScope = persistence.ProgressScope;
+pub const PagedPresentation = persistence.PagedPresentation;
 pub const ProgressView = reading_progress.View;
 pub const SettingsRow = settings_menu.Row;
 pub const Readiness = enum { opening, ready, chapter_error };
@@ -87,6 +107,7 @@ pub const ChapterOpenAction = union(enum) {
     word_rescan: u32,
     rsvp_rescan: rsvp_reader.RsvpReader.RescanTarget,
     rescan_to_last_page,
+    scroll_rescan: u32,
 };
 
 pub const ChapterOpenJob = struct {
@@ -118,9 +139,11 @@ pub const ReaderCoordinator = struct {
     screen: Screen = .library,
     screen_before_settings: Screen = .reading,
     mode: ReadingMode = .paged,
+    paged_presentation: PagedPresentation = .pages,
     settings_menu_state: settings_menu.Model = .{},
     theme: Theme = .light,
-    font: Font = .roobert,
+    pages_font: ReadingFont = .roobert_20_medium,
+    rsvp_font: ReadingFont = .roobert_20_medium,
     progress_visibility: ProgressVisibility = .off,
     progress_position: ProgressPosition = .top,
     progress_scope: ProgressScope = .chapter,
@@ -146,6 +169,7 @@ pub const ReaderCoordinator = struct {
     chapter_index: u8 = 0,
     chapter_end: bool = false,
     pending_prefetch_transition: ?u8 = null,
+    scroll_align_chapter_end: bool = false,
     lifecycle: Lifecycle = .opening,
     chapter_failure: ChapterFailure = .archive,
     zip_entries: [epub.max_manifest_items]zip.IndexedEntry = undefined,
@@ -164,6 +188,7 @@ pub const ReaderCoordinator = struct {
     chapter_output_end: usize = 0,
     telemetry: telemetry.Telemetry = .{},
     crank_accumulated: f32 = 0,
+    scroll_crank_millidegrees: i32 = 0,
     crank_docked: bool = false,
     reset_hold_started_at: ?u32 = null,
     reset_hold_elapsed_ms: u16 = 0,
@@ -179,9 +204,11 @@ pub const ReaderCoordinator = struct {
         self.screen = .library;
         self.screen_before_settings = .reading;
         self.mode = .paged;
+        self.paged_presentation = .pages;
         self.settings_menu_state = .{};
         self.theme = .light;
-        self.font = .roobert;
+        self.pages_font = .roobert_20_medium;
+        self.rsvp_font = .roobert_20_medium;
         self.progress_visibility = .off;
         self.progress_position = .top;
         self.progress_scope = .chapter;
@@ -204,6 +231,7 @@ pub const ReaderCoordinator = struct {
         self.chapter_index = 0;
         self.chapter_end = false;
         self.pending_prefetch_transition = null;
+        self.scroll_align_chapter_end = false;
         self.lifecycle = .opening;
         self.chapter_failure = .archive;
         self.archive_index = null;
@@ -212,6 +240,7 @@ pub const ReaderCoordinator = struct {
         self.chapter_output_end = 0;
         self.telemetry = .{};
         self.crank_accumulated = 0;
+        self.scroll_crank_millidegrees = 0;
         self.crank_docked = false;
         self.reset_hold_started_at = null;
         self.reset_hold_elapsed_ms = 0;
@@ -235,7 +264,7 @@ pub const ReaderCoordinator = struct {
 
     pub fn measureText(self: *const ReaderCoordinator, text: []const u8) usize {
         const measure = self.host.?.measure;
-        return measure.width(measure.context, text);
+        return measuredWidth(measure, self.pages_font, text);
     }
 
     /// Rebuilds the bounded library through the platform-neutral file lister.
@@ -254,10 +283,12 @@ pub const ReaderCoordinator = struct {
         self.mode = if (settings.reading_mode == .rsvp) .rsvp else .paged;
         self.rsvp_reader.wpm = settings.rsvp_wpm;
         self.theme = settings.theme;
-        self.font = settings.font;
+        self.pages_font = settings.pages_font;
+        self.rsvp_font = settings.rsvp_font;
         self.progress_visibility = settings.progress_visibility;
         self.progress_position = settings.progress_position;
         self.progress_scope = settings.progress_scope;
+        self.paged_presentation = settings.paged_presentation;
     }
 
     pub fn saveSettings(self: *ReaderCoordinator) void {
@@ -266,10 +297,12 @@ pub const ReaderCoordinator = struct {
             .reading_mode = if (self.mode == .rsvp) .rsvp else .paged,
             .rsvp_wpm = self.rsvp_reader.wpm,
             .theme = self.theme,
-            .font = self.font,
+            .pages_font = self.pages_font,
+            .rsvp_font = self.rsvp_font,
             .progress_visibility = self.progress_visibility,
             .progress_position = self.progress_position,
             .progress_scope = self.progress_scope,
+            .paged_presentation = self.paged_presentation,
         });
     }
 
@@ -357,8 +390,17 @@ pub const ReaderCoordinator = struct {
     }
 
     fn currentPagedWordOrdinal(self: *const ReaderCoordinator) u32 {
+        if (self.paged_presentation == .scroll) {
+            if (self.paged.scrollFirstVisibleWord(self.scrollGeometry())) |ordinal| return ordinal;
+        }
         const page = self.paged.current() orelse return self.paged.selected_word_ordinal orelse 0;
         return page.moveSelection(self.paged.selected_word_ordinal, 0) orelse 0;
+    }
+
+    fn scrollGeometry(self: *const ReaderCoordinator) scroll_geometry.Geometry {
+        const measure = if (self.host) |host| host.measure else return scroll_geometry.Geometry.init(20);
+        const font_height = measuredFontHeight(measure, self.pages_font);
+        return scroll_geometry.Geometry.init(font_height);
     }
 
     fn bookIdentity(self: *const ReaderCoordinator) u32 {
@@ -393,6 +435,8 @@ pub const ReaderCoordinator = struct {
         self.pending_mode_word_ordinal = null;
         self.pending_prefetch_transition = null;
         self.paged.detent_backlog = 0;
+        self.paged.clearScrollTransient();
+        self.scroll_crank_millidegrees = 0;
         self.clearResetHold();
         self.returnToLibrary();
         self.lifecycle = .opening;
@@ -401,6 +445,8 @@ pub const ReaderCoordinator = struct {
     pub fn openSettings(self: *ReaderCoordinator) bool {
         if (self.screen != .reading) return false;
         self.manual_pace.discard();
+        self.paged.clearScrollTransient();
+        self.scroll_crank_millidegrees = 0;
         self.screen_before_settings = self.screen;
         self.screen = .settings;
         return true;
@@ -429,6 +475,8 @@ pub const ReaderCoordinator = struct {
     pub fn openChapterBrowser(self: *ReaderCoordinator) bool {
         if (self.screen != .reading) return false;
         self.manual_pace.discard();
+        self.paged.clearScrollTransient();
+        self.scroll_crank_millidegrees = 0;
         self.screen = .chapter_browser;
         return true;
     }
@@ -760,10 +808,13 @@ pub const ReaderCoordinator = struct {
         self.cancelPrefetch();
         self.cancelChapter();
         self.chapter_open = .{ .index = index, .action = action };
-        self.paged.builder = null;
-        self.paged.current_ready = false;
-        self.paged.next_ready = false;
-        self.paged.selected_word_ordinal = null;
+        self.scroll_align_chapter_end = self.mode == .paged and self.paged_presentation == .scroll and action == .rescan_to_last_page;
+        if (action != .scroll_rescan) {
+            self.paged.builder = null;
+            self.paged.current_ready = false;
+            self.paged.next_ready = false;
+            self.paged.selected_word_ordinal = null;
+        }
         self.chapter_end = false;
         self.paged.chapter_end = false;
     }
@@ -811,7 +862,11 @@ pub const ReaderCoordinator = struct {
         const index = job.index;
         const action = job.action;
         self.chapter_open = null;
-        self.beginOpenedChapter(archive, index, entry, now_ms) catch {
+        const scroll_target = switch (action) {
+            .scroll_rescan => |target| target,
+            else => null,
+        };
+        self.beginOpenedChapter(archive, index, entry, now_ms, scroll_target) catch {
             self.failChapter(.archive);
             return .{ .worked = true };
         };
@@ -821,6 +876,7 @@ pub const ReaderCoordinator = struct {
             .word_rescan => |target| self.paged.beginWordRescan(target),
             .rsvp_rescan => |target| self.rsvp_reader.reconstruct(target),
             .rescan_to_last_page => self.paged.beginRescanToLastPage(),
+            .scroll_rescan => {},
         }
         return .{ .worked = true };
     }
@@ -914,6 +970,10 @@ pub const ReaderCoordinator = struct {
                         self.failChapter(.page_limit);
                         return .{ .worked = true };
                     }
+                    if (self.scroll_align_chapter_end) {
+                        self.paged.clampScrollAtChapterEnd(self.scrollGeometry());
+                        self.scroll_align_chapter_end = false;
+                    }
                     stream.finish() catch {
                         self.failChapter(.archive);
                         return .{ .worked = true };
@@ -957,7 +1017,7 @@ pub const ReaderCoordinator = struct {
         return if (self.chapter_index + 1 < self.publication.spine_len) self.chapter_index + 1 else null;
     }
 
-    fn beginOpenedChapter(self: *ReaderCoordinator, archive: zip.Archive, index: u8, entry: zip.Entry, now_ms: u32) !void {
+    fn beginOpenedChapter(self: *ReaderCoordinator, archive: zip.Archive, index: u8, entry: zip.Entry, now_ms: u32, scroll_rescan_target: ?u32) !void {
         if (self.decode_workspace.beginActive() != .acquired) return error.DecodeWorkspaceBusy;
         self.chapter_storage = zip.StreamStorage.init(&self.deflate_input_buffer, &self.deflate_window, &self.deflate_workspace);
         self.chapter_stream = archive.begin(entry, &self.chapter_storage) catch |err| {
@@ -966,8 +1026,9 @@ pub const ReaderCoordinator = struct {
         };
         self.chapter_index = index;
         self.progress_worker.setCurrentChapter(index) catch {};
-        const measure = self.host.?.measure;
-        self.paged.begin(index, reader_layout.text_width, paginationMeasure(measure));
+        if (scroll_rescan_target) |target| {
+            if (!self.paged.beginScrollRescan(reader_layout.text_width, paginationMeasure(self), target)) return error.ScrollRescanUnavailable;
+        } else self.paged.begin(index, reader_layout.text_width, paginationMeasure(self));
         self.chapter_end = false;
         self.chapter_output_start = 0;
         self.chapter_output_end = 0;
@@ -1058,7 +1119,6 @@ pub const ReaderCoordinator = struct {
                         self.openPendingPrefetchTransition();
                         return;
                     };
-                    const measure = self.host.?.measure;
                     self.paged.prefetch.begin(
                         found.archive,
                         found.entry,
@@ -1069,7 +1129,7 @@ pub const ReaderCoordinator = struct {
                         &self.deflate_window,
                         &self.deflate_workspace,
                         reader_layout.text_width,
-                        paginationMeasure(measure),
+                        paginationMeasure(self),
                     ) catch {
                         self.cancelPrefetch();
                         self.openPendingPrefetchTransition();
@@ -1156,6 +1216,11 @@ pub const ReaderCoordinator = struct {
     }
 
     fn failChapter(self: *ReaderCoordinator, failure: ChapterFailure) void {
+        if (self.paged.isScrollRescanning() or (self.chapter_open != null and self.chapter_open.?.action == .scroll_rescan)) {
+            self.paged.markScrollPreviousUnavailable();
+            self.cancelChapter();
+            return;
+        }
         self.manual_pace.discard();
         self.chapter_failure = failure;
         self.paged.current_ready = false;
@@ -1163,6 +1228,16 @@ pub const ReaderCoordinator = struct {
         self.chapter_end = true;
         self.lifecycle = .chapter_error;
         self.cancelChapter();
+    }
+
+    /// C5 routes a Scroll cache miss here after the input policy has selected
+    /// the presentation. The opening path resets only decode state; the
+    /// already-visible page window remains available to the renderer.
+    pub fn beginScrollPreviousReconstruction(self: *ReaderCoordinator) bool {
+        if (self.lifecycle != .ready or self.chapter_open != null) return false;
+        const target = self.paged.scrollPreviousRescanTarget() orelse return false;
+        self.openChapter(self.chapter_index, .{ .scroll_rescan = target });
+        return true;
     }
 
     fn beginMetadataRead(self: *ReaderCoordinator, job: *opening_session.Session, entry: zip.Entry, target: opening_session.MetadataTarget) zip.Error!void {
@@ -1220,6 +1295,7 @@ pub const ReaderCoordinator = struct {
             .screen = self.screen,
             .readiness = if (self.lifecycle == .chapter_error) .chapter_error else if (self.lifecycle == .opening) .opening else .ready,
             .mode = self.mode,
+            .paged_presentation = if (self.paged_presentation == .scroll) .scroll else .pages,
             .buttons = frame.buttons,
         });
         self.performIntent(intent, now_ms);
@@ -1234,9 +1310,12 @@ pub const ReaderCoordinator = struct {
         }
         const chapter = self.stepChapter(now_ms);
         if (chapter.position_changed) self.requestPositionSave();
+        self.resumeScrollBackwardAfterChapterWork(chapter.worked);
         if (chapter.request_prefetch) _ = self.startPrefetch();
         self.fulfillPendingPagedSelection();
-        if (self.mode == .paged and !self.crank_docked) self.drainPagedDetents(now_ms);
+        if (self.mode == .paged and !self.crank_docked) {
+            if (self.paged_presentation == .scroll) self.drainScrollDetents(now_ms) else self.drainPagedDetents(now_ms);
+        }
         const prefetch_worked = self.paged.prefetch.isPrefetching();
         self.stepPrefetch();
         self.stepProgressIndex(chapter.worked or prefetch_worked);
@@ -1262,6 +1341,10 @@ pub const ReaderCoordinator = struct {
         return switch (self.mode) {
             .paged => blk: {
                 if (self.paged.isReconstructing() or self.paged.pending_selection != null) break :blk null;
+                if (self.paged_presentation == .scroll) {
+                    const word = self.paged.scrollFirstVisibleWord(self.scrollGeometry()) orelse break :blk null;
+                    break :blk .{ .scroll = .{ .chapter = self.chapter_index, .word = word } };
+                }
                 _ = self.paged.current() orelse break :blk null;
                 break :blk .{ .paged = .{ .chapter = self.chapter_index, .page = self.paged.page_index } };
             },
@@ -1289,11 +1372,15 @@ pub const ReaderCoordinator = struct {
     pub fn systemPaused(self: *ReaderCoordinator, now_ms: u32) void {
         self.manual_pace.discard();
         self.stopAutoplayAccounting(now_ms);
+        self.paged.clearScrollTransient();
+        self.scroll_crank_millidegrees = 0;
         self.flushPaceNow();
     }
 
     pub fn systemResumed(self: *ReaderCoordinator) void {
         self.manual_pace.discard();
+        self.paged.clearScrollTransient();
+        self.scroll_crank_millidegrees = 0;
     }
 
     pub fn handleSystemAction(self: *ReaderCoordinator, action: SystemAction, now_ms: u32) void {
@@ -1339,6 +1426,7 @@ pub const ReaderCoordinator = struct {
             .settings_previous => self.moveSettingsSelection(-1),
             .activate_setting => switch (self.settings_menu_state.selected) {
                 .reading_mode => self.switchReadingMode(now_ms),
+                .paged_presentation => self.switchPagedPresentation(),
                 .rsvp_wpm => {
                     _ = self.rsvp_reader.adjustWpm(1, now_ms, &self.pace);
                     self.saveSettings();
@@ -1347,7 +1435,8 @@ pub const ReaderCoordinator = struct {
                     self.theme = if (self.theme == .light) .dark else .light;
                     self.saveSettings();
                 },
-                .font => self.switchFont(),
+                .pages_font => self.switchPagesFont(),
+                .rsvp_font => self.switchRsvpFont(),
                 .progress_visibility => {
                     self.progress_visibility = if (self.progress_visibility == .off) .on else .off;
                     self.saveSettings();
@@ -1404,6 +1493,8 @@ pub const ReaderCoordinator = struct {
                     if (changes_position) self.requestPositionSaveAfterReadingMovement();
                 }
             },
+            .scroll_forward => self.moveScroll(.forward, now_ms),
+            .scroll_backward => self.moveScroll(.backward, now_ms),
             .next_chapter => self.openAdjacentChapter(1),
             .previous_chapter => self.openAdjacentChapter(-1),
         }
@@ -1418,6 +1509,9 @@ pub const ReaderCoordinator = struct {
         self.stopAutoplayAccounting(now_ms);
         self.paged.pending_selection = null;
         self.paged.detent_backlog = 0;
+        self.paged.clearScrollTransient();
+        self.manual_pace.discard();
+        self.scroll_crank_millidegrees = 0;
         self.crank_accumulated = 0;
         self.pending_mode_word_ordinal = target_word;
         if (self.lifecycle == .ready) {
@@ -1433,20 +1527,48 @@ pub const ReaderCoordinator = struct {
         self.saveSettings();
     }
 
-    fn switchFont(self: *ReaderCoordinator) void {
-        self.font = switch (self.font) {
-            .roobert => .newsleak_serif,
-            .newsleak_serif => .asheville_sans,
-            .asheville_sans => .roobert,
+    fn switchPagedPresentation(self: *ReaderCoordinator) void {
+        const word = self.currentPagedWordOrdinal();
+        self.paged_presentation = switch (self.paged_presentation) {
+            .pages => .scroll,
+            .scroll => .pages,
         };
+        self.paged.clearScrollTransient();
+        self.manual_pace.discard();
+        self.scroll_crank_millidegrees = 0;
+        if (self.mode == .paged and self.lifecycle == .ready) {
+            switch (self.paged_presentation) {
+                .pages => {
+                    _ = self.paged.showScrollTopPage();
+                    self.paged.selected_word_ordinal = word;
+                },
+                .scroll => self.paged.beginScrollAtWord(word, self.scrollGeometry()),
+            }
+            self.requestPositionSave();
+        }
+        self.saveSettings();
+    }
+
+    fn switchPagesFont(self: *ReaderCoordinator) void {
+        self.pages_font = persistence.nextReadingFont(self.pages_font);
         self.saveSettings();
         if (self.lifecycle != .ready or self.mode != .paged) return;
 
         const target_word = reader_transitions.pagedModeSwitchOrdinal(self.currentPagedWordOrdinal(), self.paged.pending_selection);
         self.pending_mode_word_ordinal = target_word;
         self.paged.pending_selection = .{ .ordinal = target_word };
+        self.paged.clearScrollTransient();
+        self.scroll_crank_millidegrees = 0;
         self.openChapter(self.chapter_index, .{ .word_rescan = target_word });
         self.requestPositionSave();
+    }
+
+    fn switchRsvpFont(self: *ReaderCoordinator) void {
+        self.rsvp_font = persistence.nextReadingFont(self.rsvp_font);
+        self.saveSettings();
+        // RSVP positions are word-based. Re-rendering with new metrics keeps
+        // its ring and semantic cursor intact, while Pages/Scroll stay idle.
+        if (self.mode == .rsvp) self.manual_pace.discard();
     }
 
     fn adjustRsvpWpm(self: *ReaderCoordinator, direction: i8, now_ms: u32) void {
@@ -1501,6 +1623,14 @@ pub const ReaderCoordinator = struct {
             self.handleRsvpMove(move);
             return;
         }
+        if (self.paged_presentation == .scroll) {
+            const pixels = scrollPixelsForCrank(&self.scroll_crank_millidegrees, change);
+            if (pixels == 0) return;
+            const direction: scroll_geometry.Direction = if (pixels > 0) .forward else .backward;
+            const magnitude: u16 = @intCast(if (pixels < 0) -@as(i32, pixels) else pixels);
+            self.moveScrollPixels(direction, magnitude, now_ms);
+            return;
+        }
         self.paged.detent_backlog = saturatingAddDetents(self.paged.detent_backlog, crankDetents(&self.crank_accumulated, change));
         self.drainPagedDetents(now_ms);
     }
@@ -1509,7 +1639,11 @@ pub const ReaderCoordinator = struct {
         if (self.crank_docked == docked) return;
         self.crank_docked = docked;
         self.crank_accumulated = 0;
-        if (docked) self.paged.detent_backlog = 0;
+        self.scroll_crank_millidegrees = 0;
+        if (docked) {
+            self.paged.detent_backlog = 0;
+            self.paged.clearScrollTransient();
+        }
     }
 
     fn handlePagedMove(self: *ReaderCoordinator, move: paged_reader.PagedReader.Move) void {
@@ -1533,6 +1667,66 @@ pub const ReaderCoordinator = struct {
                     return;
                 },
             }
+        }
+    }
+
+    fn moveScroll(self: *ReaderCoordinator, direction: scroll_geometry.Direction, now_ms: u32) void {
+        if (self.screen != .reading or self.mode != .paged or self.paged_presentation != .scroll or self.lifecycle != .ready or self.chapter_open != null) return;
+        const anchor = self.visibleManualPaceAnchor();
+        const before = self.currentPagedWordOrdinal();
+        if (direction == .backward) self.manual_pace.discard();
+        self.handleScrollMove(self.paged.scrollViewport(direction, self.scrollGeometry()));
+        if (direction == .forward) self.recordScrollForward(anchor, before, now_ms);
+    }
+
+    fn moveScrollPixels(self: *ReaderCoordinator, direction: scroll_geometry.Direction, pixels: u16, now_ms: u32) void {
+        if (self.screen != .reading or self.mode != .paged or self.paged_presentation != .scroll or self.lifecycle != .ready or self.chapter_open != null) return;
+        const anchor = self.visibleManualPaceAnchor();
+        const before = self.currentPagedWordOrdinal();
+        if (direction == .backward) self.manual_pace.discard();
+        self.handleScrollMove(self.paged.scrollPixels(direction, self.scrollGeometry(), pixels));
+        if (direction == .forward) self.recordScrollForward(anchor, before, now_ms);
+    }
+
+    /// A Scroll rescan preserves its visible viewport while rebuilding the
+    /// missing predecessor. As soon as bounded stream work publishes that
+    /// page, consume the existing loading-before displacement into it.
+    fn resumeScrollBackwardAfterChapterWork(self: *ReaderCoordinator, worked: bool) void {
+        if (!worked or self.screen != .reading or self.lifecycle != .ready or self.mode != .paged or self.paged_presentation != .scroll) return;
+        if (self.paged.scrollPosition().waiting_px >= 0) return;
+        switch (self.paged.resumeScrollBackward(self.scrollGeometry())) {
+            .moved, .at_start => self.requestPositionSaveAfterReadingMovement(),
+            .waiting, .at_end, .needs_reconstruction => {},
+        }
+    }
+
+    fn drainScrollDetents(self: *ReaderCoordinator, now_ms: u32) void {
+        if (self.screen != .reading or self.mode != .paged or self.paged_presentation != .scroll or self.lifecycle != .ready or self.chapter_open != null) return;
+        const pending_detents = self.paged.scrollPosition().pending_detents;
+        if (pending_detents == 0) return;
+        const forward = pending_detents > 0;
+        const anchor = self.visibleManualPaceAnchor();
+        const before = self.currentPagedWordOrdinal();
+        if (!forward) self.manual_pace.discard();
+        const move = if (!forward)
+            self.paged.drainScrollBackward(self.scrollGeometry())
+        else
+            self.paged.drainScrollForward(self.scrollGeometry());
+        self.handleScrollMove(move);
+        if (forward) self.recordScrollForward(anchor, before, now_ms);
+    }
+
+    fn recordScrollForward(self: *ReaderCoordinator, anchor: ?reading_pace.ManualAnchor, before: u32, now_ms: u32) void {
+        const after = self.currentPagedWordOrdinal();
+        if (after <= before) return;
+        self.recordManualPace(anchor, now_ms, after - before);
+    }
+
+    fn handleScrollMove(self: *ReaderCoordinator, move: paged_reader.PagedReader.ScrollMove) void {
+        switch (move) {
+            .moved, .at_start, .at_end => self.requestPositionSaveAfterReadingMovement(),
+            .waiting => {},
+            .needs_reconstruction => _ = self.beginScrollPreviousReconstruction(),
         }
     }
 
@@ -1576,6 +1770,7 @@ pub const ReaderCoordinator = struct {
         if (self.mode != .paged or !self.paged.current_ready) return;
         if (!self.paged.fulfillPendingSelection()) return;
         if (self.pending_mode_word_ordinal == self.paged.selected_word_ordinal) self.pending_mode_word_ordinal = null;
+        if (self.paged_presentation == .scroll) self.paged.beginScrollAtWord(self.paged.selected_word_ordinal orelse self.currentPagedWordOrdinal(), self.scrollGeometry());
         self.requestPositionSave();
     }
 
@@ -1598,7 +1793,8 @@ pub const ReaderCoordinator = struct {
     fn openAdjacentChapter(self: *ReaderCoordinator, direction: i8) void {
         const candidate: i16 = @as(i16, self.chapter_index) + direction;
         if (candidate < 0 or candidate >= self.publication.spine_len) return;
-        self.openChapter(@intCast(candidate), .normal);
+        const action: ChapterOpenAction = if (self.mode == .paged and self.paged_presentation == .scroll and direction < 0) .rescan_to_last_page else .normal;
+        self.openChapter(@intCast(candidate), action);
         self.lifecycle = .ready;
     }
 
@@ -1614,9 +1810,11 @@ pub const ReaderCoordinator = struct {
                 .first_visible = self.settings_menu_state.first_visible,
                 .row_count = self.settings_menu_state.displayedCount(),
                 .mode = self.mode,
+                .paged_presentation = self.paged_presentation,
                 .wpm = self.rsvp_reader.wpm,
                 .theme = self.theme,
-                .font = self.font,
+                .pages_font = self.pages_font,
+                .rsvp_font = self.rsvp_font,
                 .progress_visibility = self.progress_visibility,
                 .progress_position = self.progress_position,
                 .progress_scope = self.progress_scope,
@@ -1657,6 +1855,13 @@ pub const ReaderCoordinator = struct {
             .opening => .opening,
             .ready => switch (self.mode) {
                 .paged => blk: {
+                    if (self.paged_presentation == .scroll) break :blk .{ .scroll = .{
+                        .window = self.paged.scrollRenderState(self.paged.scrollPosition(), self.scrollGeometry()),
+                        .progress = self.progressView(),
+                        .progress_visibility = self.progress_visibility,
+                        .progress_position = self.progress_position,
+                        .progress_scope = self.progress_scope,
+                    } };
                     const state = self.paged.renderState();
                     var lines = [_][]const u8{""} ** pagination.max_lines;
                     var line_count: u8 = 0;
@@ -1664,10 +1869,10 @@ pub const ReaderCoordinator = struct {
                     if (state.page) |page| {
                         line_count = page.line_count;
                         for (0..page.line_count) |index| lines[index] = page.line(index);
-                        if (page.moveSelection(state.selected_word_ordinal, 0)) |selected| {
+                        if (self.paged_presentation == .pages) if (page.moveSelection(state.selected_word_ordinal, 0)) |selected| {
                             self.paged.selected_word_ordinal = selected;
                             if (!self.crank_docked) selected_span = page.wordSpan(selected);
-                        }
+                        };
                     }
                     break :blk .{ .paged = .{
                         .lines = lines,
@@ -1780,6 +1985,7 @@ pub const InputSnapshot = struct {
     screen: Screen,
     readiness: Readiness,
     mode: ReadingMode,
+    paged_presentation: PagedPresentation = .pages,
     buttons: input.Buttons,
 };
 
@@ -1803,6 +2009,10 @@ pub fn intentFor(snapshot: InputSnapshot) input.Intent {
         .mode = switch (snapshot.mode) {
             .paged => .paged,
             .rsvp => .rsvp,
+        },
+        .paged_presentation = switch (snapshot.paged_presentation) {
+            .pages => .pages,
+            .scroll => .scroll,
         },
         .buttons = snapshot.buttons,
     });
@@ -1835,9 +2045,32 @@ fn crankDetents(accumulated: *f32, change: f32) i16 {
     return detents;
 }
 
+/// Converts the SDK's angular delta to one-pixel Scroll steps. Fifteen
+/// degrees still produce twelve pixels, matching the prior detent speed, but
+/// a 1.25-degree accumulated turn now produces its first visible pixel.
+fn scrollPixelsForCrank(remainder_millidegrees: *i32, change: f32) i16 {
+    if (!std.math.isFinite(change)) return 0;
+    const bounded_change = std.math.clamp(change, -360.0, 360.0);
+    const delta_millidegrees: i32 = @intFromFloat(@round(bounded_change * 1_000.0));
+    const total = remainder_millidegrees.* + delta_millidegrees;
+    const pixels: i32 = @divTrunc(total, scroll_millidegrees_per_pixel);
+    remainder_millidegrees.* = total - pixels * scroll_millidegrees_per_pixel;
+    return @intCast(pixels);
+}
+
 fn saturatingAddDetents(existing: i16, incoming: i16) i16 {
     const total: i32 = @as(i32, existing) + @as(i32, incoming);
     return @intCast(@max(@as(i32, std.math.minInt(i16)), @min(@as(i32, std.math.maxInt(i16)), total)));
+}
+
+test "Scroll crank conversion keeps its speed while exposing pixel steps" {
+    var remainder: i32 = 0;
+    try std.testing.expectEqual(@as(i16, 0), scrollPixelsForCrank(&remainder, 1.0));
+    try std.testing.expectEqual(@as(i16, 1), scrollPixelsForCrank(&remainder, 0.25));
+    try std.testing.expectEqual(@as(i32, 0), remainder);
+    try std.testing.expectEqual(@as(i16, 12), scrollPixelsForCrank(&remainder, 15.0));
+    try std.testing.expectEqual(@as(i32, 0), remainder);
+    try std.testing.expectEqual(@as(i16, -1), scrollPixelsForCrank(&remainder, -1.25));
 }
 
 /// Data-only renderer inputs. The drawing adapter is the only layer allowed
@@ -1875,6 +2108,16 @@ pub const PagedView = struct {
     progress_scope: ProgressScope = .chapter,
 };
 
+/// Scroll tiles borrow the Paged reader's fixed cache for this frame. They
+/// contain no owned text and leave all cache policy inside `PagedReader`.
+pub const ScrollView = struct {
+    window: paged_reader.PagedReader.ScrollRenderState,
+    progress: ?reading_progress.View = null,
+    progress_visibility: ProgressVisibility = .off,
+    progress_position: ProgressPosition = .top,
+    progress_scope: ProgressScope = .chapter,
+};
+
 pub const ByteSpan = struct { start: usize, end: usize };
 
 pub const RsvpView = struct {
@@ -1899,6 +2142,7 @@ pub const RenderModel = union(enum) {
     library: LibraryView,
     opening,
     paged: PagedView,
+    scroll: ScrollView,
     rsvp: RsvpView,
     settings: SettingsView,
     statistics: StatisticsView,
@@ -1913,9 +2157,11 @@ pub const SettingsView = struct {
     first_visible: u4,
     row_count: u4,
     mode: ReadingMode,
+    paged_presentation: PagedPresentation,
     wpm: u16,
     theme: Theme,
-    font: Font,
+    pages_font: ReadingFont,
+    rsvp_font: ReadingFont,
     progress_visibility: ProgressVisibility,
     progress_position: ProgressPosition,
     progress_scope: ProgressScope,
@@ -1980,6 +2226,140 @@ test "docking hides paged focus without discarding its selected word" {
     }
 }
 
+test "Scroll presentation suppresses Paged selection and preserves its semantic word" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.current_page = 0;
+    coordinator.paged.page_index = 0;
+    try coordinator.paged.pages[0].appendLineWithMetadata("one", 0, 1);
+    try coordinator.paged.pages[0].appendLineWithMetadata("two", 0, 1);
+    coordinator.paged.pages[0].word_count = 2;
+    coordinator.paged.slots[0] = .{ .role = .displayed, .chapter = 0, .page = 0 };
+    coordinator.paged.selected_word_ordinal = 1;
+
+    coordinator.switchPagedPresentation();
+    try std.testing.expectEqual(PagedPresentation.scroll, coordinator.paged_presentation);
+    try std.testing.expectEqual(@as(u32, 1), coordinator.currentPagedWordOrdinal());
+    switch (coordinator.renderModel()) {
+        .scroll => |view| try std.testing.expectEqual(@as(u2, 2), view.window.tile_count),
+        else => return error.TestUnexpectedResult,
+    }
+
+    coordinator.switchPagedPresentation();
+    try std.testing.expectEqual(PagedPresentation.pages, coordinator.paged_presentation);
+    try std.testing.expectEqual(@as(?u32, 1), coordinator.paged.selected_word_ordinal);
+}
+
+test "restored Scroll selection anchors its target page instead of stale history" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.paged_presentation = .scroll;
+    coordinator.paged.chapter_index = 0;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.current_page = 1;
+    coordinator.paged.page_index = 5;
+    coordinator.paged.pages[0].first_word_ordinal = 0;
+    coordinator.paged.pages[0].word_count = 1;
+    try coordinator.paged.pages[0].appendLineWithMetadata("old", 0, 1);
+    coordinator.paged.pages[1].first_word_ordinal = 50;
+    coordinator.paged.pages[1].word_count = 2;
+    try coordinator.paged.pages[1].appendLineWithMetadata("target", 0, 1);
+    try coordinator.paged.pages[1].appendLineWithMetadata("next", 0, 1);
+    coordinator.paged.slots[0] = .{ .role = .history, .chapter = 0, .page = 0 };
+    coordinator.paged.slots[1] = .{ .role = .displayed, .chapter = 0, .page = 5 };
+    coordinator.paged.pending_selection = .{ .ordinal = 51 };
+
+    coordinator.fulfillPendingPagedSelection();
+
+    try std.testing.expectEqual(@as(u32, 5), coordinator.paged.scrollPosition().top_page);
+    try std.testing.expectEqual(scroll_geometry.Geometry.init(20).line_advance, coordinator.paged.scrollPosition().offset_px);
+}
+
+test "coordinator enters a rebuilt Scroll predecessor after chapter work" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.paged_presentation = .scroll;
+    coordinator.paged.chapter_index = 0;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.current_page = 1;
+    coordinator.paged.page_index = 5;
+    coordinator.paged.pages[0].line_count = 11;
+    coordinator.paged.pages[1].line_count = 11;
+    coordinator.paged.slots[0] = .{ .role = .history, .chapter = 0, .page = 4 };
+    coordinator.paged.slots[1] = .{ .role = .displayed, .chapter = 0, .page = 5 };
+    coordinator.paged.scroll_position = .{ .top_page = 5, .waiting_px = -12 };
+
+    coordinator.resumeScrollBackwardAfterChapterWork(true);
+
+    try std.testing.expectEqual(@as(u32, 4), coordinator.paged.scrollPosition().top_page);
+    try std.testing.expectEqual(@as(u16, 219), coordinator.paged.scrollPosition().offset_px);
+    try std.testing.expectEqual(@as(i16, 0), coordinator.paged.scrollPosition().waiting_px);
+}
+
+test "Scroll render model borrows continuous cached page tiles" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.paged_presentation = .scroll;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.current_page = 0;
+    coordinator.paged.page_index = 0;
+    coordinator.paged.pages[0].line_count = 11;
+    coordinator.paged.pages[1].line_count = 11;
+    coordinator.paged.slots[0] = .{ .role = .displayed, .chapter = 0, .page = 0 };
+    coordinator.paged.slots[1] = .{ .role = .history, .chapter = 0, .page = 1 };
+    coordinator.paged.scroll_position = .{ .top_page = 0, .offset_px = 100 };
+
+    switch (coordinator.renderModel()) {
+        .scroll => |view| {
+            try std.testing.expectEqual(@as(u2, 2), view.window.tile_count);
+            switch (view.window.tiles[0]) {
+                .page => |tile| try std.testing.expect(tile.cache == &coordinator.paged.pages[0]),
+                else => return error.TestUnexpectedResult,
+            }
+            switch (view.window.tiles[1]) {
+                .page => |tile| {
+                    try std.testing.expect(tile.cache == &coordinator.paged.pages[1]);
+                    try std.testing.expectEqual(@as(i16, -96 + 11 * 21), tile.origin_y);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Scroll pace samples only forward first-visible-word progress" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.paged_presentation = .scroll;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.current_page = 0;
+    try coordinator.paged.pages[0].appendLineWithMetadata("one", 0, 1);
+    try coordinator.paged.pages[0].appendLineWithMetadata("two", 0, 1);
+    coordinator.paged.pages[0].word_count = 2;
+    coordinator.paged.slots[0] = .{ .role = .displayed, .chapter = 0, .page = 0 };
+    const anchor = coordinator.visibleManualPaceAnchor().?;
+    coordinator.manual_pace.observe(anchor, 1_000);
+    coordinator.paged.scroll_position.offset_px = scroll_geometry.Geometry.init(20).line_advance;
+    coordinator.recordScrollForward(anchor, 0, 1_250);
+    try std.testing.expectEqual(@as(u32, 1), coordinator.pace.completed_words);
+
+    coordinator.paged.scroll_position.offset_px = 0;
+    coordinator.recordScrollForward(anchor, 1, 1_500);
+    try std.testing.expectEqual(@as(u32, 1), coordinator.pace.completed_words);
+}
+
 const MeasurementFake = struct {
     calls: u8 = 0,
 
@@ -1997,6 +2377,84 @@ test "coordinator measures text through its typed host" {
     coordinator.attachHost(.{ .measure = .{ .context = &fake, .width = MeasurementFake.width } });
     try std.testing.expectEqual(@as(usize, 7), coordinator.measureText("EPUB"));
     try std.testing.expectEqual(@as(u8, 1), fake.calls);
+}
+
+test "pagination measurement selects the active reading font" {
+    const FontMeasurementFake = struct {
+        fn width(_: *anyopaque, _: []const u8) usize {
+            return 1;
+        }
+
+        fn widthForFont(_: *anyopaque, font: ReadingFont, text: []const u8) usize {
+            return text.len + switch (font) {
+                .newsleak_serif => @as(usize, 10),
+                .sasser_slab => @as(usize, 20),
+                .asheville_sans_14_bold => @as(usize, 30),
+                .roobert_11_bold => @as(usize, 40),
+                .roobert_20_medium => @as(usize, 50),
+                .roobert_24_medium => @as(usize, 60),
+            };
+        }
+
+        fn heightForFont(_: *anyopaque, font: ReadingFont) usize {
+            return switch (font) {
+                .newsleak_serif => 10,
+                .sasser_slab => 20,
+                .asheville_sans_14_bold => 30,
+                .roobert_11_bold => 40,
+                .roobert_20_medium => 50,
+                .roobert_24_medium => 60,
+            };
+        }
+    };
+
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.pages_font = .asheville_sans_14_bold;
+    coordinator.attachHost(.{ .measure = .{
+        .context = &coordinator,
+        .width = FontMeasurementFake.width,
+        .width_for_font = FontMeasurementFake.widthForFont,
+        .font_height_for_font = FontMeasurementFake.heightForFont,
+    } });
+
+    const measure = paginationMeasure(&coordinator);
+    try std.testing.expectEqual(@as(usize, 33), measure.width(measure.context, "abc"));
+    try std.testing.expectEqual(reader_layout.pageLineLimit(30, pagination.max_lines), measure.line_limit);
+}
+
+test "font settings rebuild only active Pages or Scroll layout" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.lifecycle = .ready;
+    coordinator.mode = .paged;
+    coordinator.chapter_index = 2;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.current_page = 0;
+    coordinator.paged.pages[0].first_word_ordinal = 17;
+    try coordinator.paged.pages[0].appendLineWithMetadata("word", 0, 1);
+    coordinator.paged.pages[0].word_count = 1;
+    coordinator.paged.selected_word_ordinal = 17;
+
+    coordinator.switchPagesFont();
+
+    try std.testing.expectEqual(ReadingFont.roobert_24_medium, coordinator.pages_font);
+    try std.testing.expect(!coordinator.paged.current_ready);
+    switch (coordinator.chapter_open.?.action) {
+        .word_rescan => |word| try std.testing.expectEqual(@as(u32, 17), word),
+        else => return error.TestUnexpectedResult,
+    }
+
+    coordinator.chapter_open = null;
+    coordinator.paged.current_ready = true;
+    const pages_font = coordinator.pages_font;
+    coordinator.mode = .rsvp;
+    coordinator.switchRsvpFont();
+
+    try std.testing.expectEqual(pages_font, coordinator.pages_font);
+    try std.testing.expectEqual(ReadingFont.roobert_24_medium, coordinator.rsvp_font);
+    try std.testing.expect(coordinator.paged.current_ready);
+    try std.testing.expect(coordinator.chapter_open == null);
 }
 
 test "coordinator raises only semantic reconstruction work to the reconstruction ceiling" {
@@ -2405,6 +2863,34 @@ test "coordinator owns screen lifecycle without reader or platform state" {
     try std.testing.expect(coordinator.closeChapterBrowser());
     coordinator.returnToLibrary();
     try std.testing.expectEqual(Screen.library, coordinator.screen);
+}
+
+test "Scroll reconstruction request preserves cached text and a failure stays local" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.lifecycle = .ready;
+    coordinator.chapter_index = 0;
+    coordinator.paged.chapter_index = 0;
+    coordinator.paged.page_index = 1;
+    coordinator.paged.current_page = 0;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.pages[0].line_count = 11;
+    coordinator.paged.slots[0] = .{ .role = .displayed, .chapter = 0, .page = 1 };
+    coordinator.paged.scroll_position = .{ .top_page = 1, .waiting_px = -12 };
+    const visible = &coordinator.paged.pages[0];
+
+    try std.testing.expect(coordinator.beginScrollPreviousReconstruction());
+    switch (coordinator.chapter_open.?.action) {
+        .scroll_rescan => |target| try std.testing.expectEqual(@as(u32, 0), target),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(coordinator.paged.current_ready);
+    try std.testing.expect(visible == &coordinator.paged.pages[0]);
+
+    coordinator.failChapter(.archive);
+    try std.testing.expectEqual(Lifecycle.ready, coordinator.lifecycle);
+    try std.testing.expect(coordinator.paged.current_ready);
+    try std.testing.expect(coordinator.paged.scroll_previous_unavailable);
 }
 
 test "scrolling settings keeps every selection visible and reset hold uninterrupted" {

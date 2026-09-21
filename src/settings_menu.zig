@@ -1,8 +1,10 @@
 pub const Row = enum(u4) {
     reading_mode,
+    paged_presentation,
     rsvp_wpm,
     theme,
-    font,
+    pages_font,
+    rsvp_font,
     progress_visibility,
     progress_position,
     progress_scope,
@@ -10,8 +12,13 @@ pub const Row = enum(u4) {
     reset_progress,
 };
 
-pub const row_count: u4 = 9;
+pub const row_count: u4 = 11;
 pub const visible_capacity: u4 = 6;
+
+test "Pages or Scroll follows the reading-mode row" {
+    try @import("std").testing.expectEqual(@as(u4, 1), @intFromEnum(Row.paged_presentation));
+    try @import("std").testing.expectEqual(@as(u4, 11), row_count);
+}
 
 pub const Model = struct {
     selected: Row = .reading_mode,

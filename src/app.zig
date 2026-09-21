@@ -27,13 +27,26 @@ pub const App = struct {
     telemetry_menu: ?*pdapi.PDMenuItem = null,
 
     pub fn init(playdate: *pdapi.PlaydateAPI, allocator: *PlaydateAllocator) !*App {
-        const body_font = playdate.graphics.loadFont("/System/Fonts/Roobert-20-Medium.pft", null) orelse return error.FontLoadFailed;
         const newsleak_serif_font = playdate.graphics.loadFont("assets/fonts/Newsleak-Serif.pft", null) orelse return error.FontLoadFailed;
+        const newsleak_serif_bold_font = playdate.graphics.loadFont("assets/fonts/Newsleak-Serif-Bold.pft", null) orelse return error.FontLoadFailed;
+        const sasser_slab_font = playdate.graphics.loadFont("assets/fonts/Sasser-Slab.pft", null) orelse return error.FontLoadFailed;
         const asheville_sans_font = playdate.graphics.loadFont("assets/fonts/Asheville-Sans-14-Bold.pft", null) orelse return error.FontLoadFailed;
+        const roobert_11_bold_font = playdate.graphics.loadFont("/System/Fonts/Roobert-11-Bold.pft", null) orelse return error.FontLoadFailed;
+        const roobert_20_medium_font = playdate.graphics.loadFont("/System/Fonts/Roobert-20-Medium.pft", null) orelse return error.FontLoadFailed;
+        const roobert_24_medium_font = playdate.graphics.loadFont("/System/Fonts/Roobert-24-Medium.pft", null) orelse return error.FontLoadFailed;
         const app = try allocator.allocator().create(App);
         app.playdate = playdate;
         app.allocator = allocator;
-        app.renderer = PlaydateRenderer.init(playdate, body_font, newsleak_serif_font, asheville_sans_font);
+        app.renderer = PlaydateRenderer.init(
+            playdate,
+            newsleak_serif_font,
+            newsleak_serif_bold_font,
+            sasser_slab_font,
+            asheville_sans_font,
+            roobert_11_bold_font,
+            roobert_20_medium_font,
+            roobert_24_medium_font,
+        );
         app.opening_file = null;
         app.chapter_file = null;
         app.prefetch_file = null;
@@ -44,7 +57,6 @@ pub const App = struct {
         app.coordinator.attachPersistence(persistence.Service.init(playdate_persistence.fileStore(playdate.file)));
         app.coordinator.attachHost(app.readerHost());
         app.coordinator.loadSettings();
-        app.renderer.selectFont(app.coordinator.font);
         app.installSystemMenu();
         app.discoverLibrary();
         return app;
@@ -66,7 +78,7 @@ pub const App = struct {
             .crank_docked = self.playdate.system.isCrankDocked() != 0,
         }, started_at);
 
-        self.renderer.beginFrame(self.coordinator.theme, self.coordinator.font);
+        self.renderer.beginFrame(self.coordinator.theme, self.coordinator.pages_font, self.coordinator.rsvp_font);
         self.renderer.draw(self.coordinator.renderModel());
         if (self.coordinator.telemetrySnapshot()) |snapshot| self.renderer.drawTelemetry(snapshot, self.allocator.stats);
         return 1;
@@ -87,7 +99,13 @@ pub const App = struct {
     fn readerHost(self: *App) reader_host.ReaderHost {
         return .{
             .files = .{ .context = self, .open = openReaderFile, .close = closeReaderFile, .list_epubs = listEpubs },
-            .measure = .{ .context = self, .width = measureTextWidth, .font_height = measureFontHeight },
+            .measure = .{
+                .context = self,
+                .width = measureTextWidth,
+                .font_height = measureFontHeight,
+                .width_for_font = measureTextWidthForFont,
+                .font_height_for_font = measureFontHeightForFont,
+            },
         };
     }
 
@@ -104,7 +122,7 @@ pub const App = struct {
     }
 
     fn textWidth(self: *const App, text: []const u8) c_int {
-        return self.renderer.textWidth(text);
+        return self.renderer.readingTextWidth(.roobert_20_medium, text);
     }
 };
 
@@ -157,7 +175,17 @@ fn measureTextWidth(context: *anyopaque, text: []const u8) usize {
 
 fn measureFontHeight(context: *anyopaque) usize {
     const app: *App = @ptrCast(@alignCast(context));
-    return app.renderer.fontHeight();
+    return app.renderer.readingFontHeight(.roobert_20_medium);
+}
+
+fn measureTextWidthForFont(context: *anyopaque, font: reader_coordinator.ReadingFont, text: []const u8) usize {
+    const app: *App = @ptrCast(@alignCast(context));
+    return @intCast(app.renderer.readingTextWidth(font, text));
+}
+
+fn measureFontHeightForFont(context: *anyopaque, font: reader_coordinator.ReadingFont) usize {
+    const app: *App = @ptrCast(@alignCast(context));
+    return app.renderer.readingFontHeight(font);
 }
 
 fn buttonsFromPlaydate(pushed: pdapi.PDButtons) reader_input.Buttons {

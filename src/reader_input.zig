@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Screen = enum { library, opening, reading, settings, statistics, chapter_browser };
 pub const Readiness = enum { opening, ready, chapter_error };
 pub const ReadingMode = enum { paged, rsvp };
+pub const PagedPresentation = enum { pages, scroll };
 
 pub const Buttons = struct {
     a: bool = false,
@@ -17,6 +18,7 @@ pub const Snapshot = struct {
     screen: Screen,
     readiness: Readiness,
     mode: ReadingMode,
+    paged_presentation: PagedPresentation = .pages,
     buttons: Buttons,
 };
 
@@ -42,6 +44,8 @@ pub const Intent = enum {
     rsvp_previous_sentence,
     next_page,
     previous_page,
+    scroll_forward,
+    scroll_backward,
     next_chapter,
     previous_chapter,
 };
@@ -84,9 +88,29 @@ pub fn intentFor(snapshot: Snapshot) Intent {
         if (snapshot.buttons.left) return .rsvp_previous_sentence;
         return .none;
     }
+    if (snapshot.screen == .reading and snapshot.paged_presentation == .scroll) {
+        if (snapshot.buttons.right) return .next_chapter;
+        if (snapshot.buttons.left) return .previous_chapter;
+        if (snapshot.buttons.down) return .scroll_forward;
+        if (snapshot.buttons.up) return .scroll_backward;
+        return .none;
+    }
     if (snapshot.buttons.right or snapshot.buttons.down) return .next_page;
     if (snapshot.buttons.left or snapshot.buttons.up) return .previous_page;
     return .none;
+}
+
+test "Scroll assigns directions to chapter and viewport movement" {
+    const base = Snapshot{ .screen = .reading, .readiness = .ready, .mode = .paged, .paged_presentation = .scroll, .buttons = .{} };
+    var snapshot = base;
+    snapshot.buttons.right = true;
+    try std.testing.expectEqual(Intent.next_chapter, intentFor(snapshot));
+    snapshot.buttons = .{ .left = true };
+    try std.testing.expectEqual(Intent.previous_chapter, intentFor(snapshot));
+    snapshot.buttons = .{ .down = true };
+    try std.testing.expectEqual(Intent.scroll_forward, intentFor(snapshot));
+    snapshot.buttons = .{ .up = true };
+    try std.testing.expectEqual(Intent.scroll_backward, intentFor(snapshot));
 }
 
 test "reading gives the mode toggle priority over page navigation" {

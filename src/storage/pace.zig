@@ -33,6 +33,7 @@ pub const ActiveSession = struct {
 
 pub const ManualAnchor = union(enum) {
     paged: struct { chapter: u8, page: u32 },
+    scroll: struct { chapter: u8, word: u32 },
     rsvp: struct { chapter: u8, word: u32 },
 };
 

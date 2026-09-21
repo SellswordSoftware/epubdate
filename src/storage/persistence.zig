@@ -10,10 +10,12 @@ pub const ReadingSnapshot = reading_state.ReadingSnapshot;
 pub const RestoredPosition = reading_state.RestoredPosition;
 pub const Settings = reader_settings.Settings;
 pub const Theme = reader_settings.Theme;
-pub const Font = reader_settings.Font;
+pub const ReadingFont = reader_settings.ReadingFont;
+pub const nextReadingFont = reader_settings.nextReadingFont;
 pub const ProgressVisibility = reader_settings.ProgressVisibility;
 pub const ProgressPosition = reader_settings.ProgressPosition;
 pub const ProgressScope = reader_settings.ProgressScope;
+pub const PagedPresentation = reader_settings.PagedPresentation;
 pub const Pace = reading_pace.Stats;
 pub const ProgressKey = reading_progress.Key;
 pub const ProgressIndex = reading_progress.Index;
@@ -239,15 +241,17 @@ test "a failed due pace write stays pending until it can be persisted" {
 test "settings persist independently of per-book records" {
     var files = MemoryFiles{};
     var service = Service.init(files.port());
-    try std.testing.expect(service.saveSettings(.{ .reading_mode = .rsvp, .rsvp_wpm = 425, .theme = .dark, .font = .newsleak_serif }));
-    try std.testing.expectEqual(Settings{ .reading_mode = .rsvp, .rsvp_wpm = 425, .theme = .dark, .font = .newsleak_serif }, service.loadSettings());
+    const settings = Settings{ .reading_mode = .rsvp, .rsvp_wpm = 425, .theme = .dark, .pages_font = .newsleak_serif, .rsvp_font = .roobert_24_medium };
+    try std.testing.expect(service.saveSettings(settings));
+    try std.testing.expectEqual(settings, service.loadSettings());
 }
 
-test "the Asheville font round trips through the settings record" {
+test "independent reading fonts round trip through the settings record" {
     var files = MemoryFiles{};
     var service = Service.init(files.port());
-    try std.testing.expect(service.saveSettings(.{ .reading_mode = .paged, .rsvp_wpm = 300, .theme = .light, .font = .asheville_sans }));
-    try std.testing.expectEqual(Settings{ .reading_mode = .paged, .rsvp_wpm = 300, .theme = .light, .font = .asheville_sans }, service.loadSettings());
+    const settings = Settings{ .reading_mode = .paged, .rsvp_wpm = 300, .theme = .light, .pages_font = .asheville_sans_14_bold, .rsvp_font = .sasser_slab };
+    try std.testing.expect(service.saveSettings(settings));
+    try std.testing.expectEqual(settings, service.loadSettings());
 }
 
 test "progress indexes persist by book identity and retry failed writes" {
