@@ -5,6 +5,7 @@ const xhtml = @import("content/xhtml.zig");
 const pagination = @import("content/pagination.zig");
 const epub = @import("publication/epub.zig");
 const publication_navigation = @import("publication/navigation.zig");
+const limits = @import("limits").reader;
 
 const FixtureReader = struct {
     io: std.Io,
@@ -27,7 +28,7 @@ const FixtureReader = struct {
 };
 
 fn validateDirectory(archive: zip.Archive) !void {
-    var ranges: [epub.max_manifest_items]zip.MemberRange = undefined;
+    var ranges: [limits.max_archive_entries]zip.MemberRange = undefined;
     var filename: [256]u8 = undefined;
     var validator = try zip.DirectoryValidator.init(archive, &ranges);
     while (!try validator.step(&filename)) {}

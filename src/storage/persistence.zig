@@ -11,7 +11,10 @@ pub const RestoredPosition = reading_state.RestoredPosition;
 pub const Settings = reader_settings.Settings;
 pub const Theme = reader_settings.Theme;
 pub const ReadingFont = reader_settings.ReadingFont;
-pub const nextReadingFont = reader_settings.nextReadingFont;
+pub const nextPagesFont = reader_settings.nextPagesFont;
+pub const nextRsvpFont = reader_settings.nextRsvpFont;
+pub const normalizePagesFont = reader_settings.normalizePagesFont;
+pub const normalizeRsvpFont = reader_settings.normalizeRsvpFont;
 pub const ProgressVisibility = reader_settings.ProgressVisibility;
 pub const ProgressPosition = reader_settings.ProgressPosition;
 pub const ProgressScope = reader_settings.ProgressScope;
@@ -101,8 +104,26 @@ pub const Service = struct {
         var name: [24]u8 = undefined;
         const filename = progressFilename(&name, key.book_id) orelse return null;
         var bytes: [reading_progress.encoded_size]u8 = undefined;
-        if (!self.files.read(self.files.context, filename, &bytes)) return null;
-        return reading_progress.decode(&bytes, key) catch null;
+        if (self.files.read(self.files.context, filename, &bytes)) return reading_progress.decode(&bytes, key) catch null;
+        var legacy_bytes: [reading_progress.legacy_encoded_size]u8 = undefined;
+        if (!self.files.read(self.files.context, filename, &legacy_bytes)) return null;
+        return reading_progress.decodeLegacy(&legacy_bytes, key) catch null;
+    }
+
+    /// Reads the last self-validating progress record for a library entry.
+    /// Opening the book still performs the stricter fingerprint check above.
+    pub fn loadLibraryProgress(self: *const Service, book_id: u32) ?ProgressIndex {
+        var name: [24]u8 = undefined;
+        const filename = progressFilename(&name, book_id) orelse return null;
+        var bytes: [reading_progress.encoded_size]u8 = undefined;
+        const index = if (self.files.read(self.files.context, filename, &bytes))
+            reading_progress.decodeStored(&bytes) catch return null
+        else blk: {
+            var legacy_bytes: [reading_progress.legacy_encoded_size]u8 = undefined;
+            if (!self.files.read(self.files.context, filename, &legacy_bytes)) return null;
+            break :blk reading_progress.decodeLegacyStored(&legacy_bytes) catch return null;
+        };
+        return if (index.key.book_id == book_id) index else null;
     }
 
     pub fn saveProgress(self: *const Service, index: ProgressIndex) bool {

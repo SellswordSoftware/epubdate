@@ -3,8 +3,10 @@ const limits = @import("limits").reader;
 
 pub const Error = error{ MalformedXml, CapacityExceeded, MissingManifestItem };
 
-pub const max_manifest_items = limits.max_archive_entries;
-pub const max_spine_items = limits.max_archive_entries;
+/// The OPF workspace retains only readable XHTML and navigation items; image,
+/// font, and stylesheet assets do not consume reader memory.
+pub const max_manifest_items = limits.max_epub_manifest_items;
+pub const max_spine_items = limits.max_epub_spine_items;
 /// A browser row has room for a short human label. Keep every label bounded so
 /// publication metadata stays independent of the size of an EPUB TOC.
 pub const max_chapter_label_bytes = 48;
@@ -45,12 +47,13 @@ pub const NavigationSource = struct {
 };
 
 const ManifestItem = struct {
-    id: [64]u8 = undefined,
-    id_len: u8 = 0,
-    href: [128]u8 = undefined,
-    href_len: u8 = 0,
+    id_offset: u32 = 0,
+    id_len: u32 = 0,
+    href_offset: u32 = 0,
+    href_len: u32 = 0,
     is_readable: bool = false,
     is_navigation_document: bool = false,
+    is_ncx_document: bool = false,
 };
 
 pub const Publication = struct {
@@ -74,8 +77,29 @@ pub const OpfWorkspace = struct {
     manifest_len: u8 = 0,
 };
 
-test "persistent publication excludes transient OPF manifest storage" {
-    try std.testing.expect(@sizeOf(Publication) < @sizeOf(OpfWorkspace));
+test "OPF workspace references package text instead of copying manifest strings" {
+    try std.testing.expect(@sizeOf(OpfWorkspace) < 4 * 1024);
+}
+
+test "OPF ignores non-reading assets when retaining its manifest" {
+    var xml: [16 * 1024]u8 = undefined;
+    var len: usize = 0;
+    const prefix = "<package><manifest>";
+    @memcpy(xml[len .. len + prefix.len], prefix);
+    len += prefix.len;
+    for (0..max_manifest_items + 1) |index| {
+        const item = try std.fmt.bufPrint(xml[len..], "<item id=\"image{d}\" href=\"image{d}.jpg\" media-type=\"image/jpeg\"/>", .{ index, index });
+        len += item.len;
+    }
+    const suffix = "<item id=\"chapter\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"chapter\"/></spine></package>";
+    @memcpy(xml[len .. len + suffix.len], suffix);
+    len += suffix.len;
+
+    var publication: Publication = undefined;
+    var workspace: OpfWorkspace = undefined;
+    try parseOpf(xml[0..len], "content.opf", &publication, &workspace);
+    try std.testing.expectEqual(@as(u8, 1), publication.spine_len);
+    try std.testing.expectEqualStrings("chapter.xhtml", publication.spine[0].slice());
 }
 
 pub fn parseContainer(xml: []const u8, destination: []u8) Error![]const u8 {
@@ -104,18 +128,36 @@ pub fn parseOpf(xml: []const u8, package_path: []const u8, publication: *Publica
             const id = attribute(element.attributes, "id") orelse continue;
             const href = attribute(element.attributes, "href") orelse continue;
             const media_type = attribute(element.attributes, "media-type") orelse continue;
+            const is_readable = std.mem.eql(u8, media_type, "application/xhtml+xml");
+            const is_navigation_document = propertiesContain(attribute(element.attributes, "properties"), "nav");
+            const is_ncx_document = std.mem.eql(u8, media_type, "application/x-dtbncx+xml");
+            // A manifest can contain hundreds of images. Retain only members
+            // which the reader can use to resolve its spine or navigation.
+            if (!is_readable and !is_navigation_document and !is_ncx_document) continue;
             if (workspace.manifest_len == max_manifest_items) return error.CapacityExceeded;
+            var decoded_id: [64]u8 = undefined;
+            var decoded_id_len: u8 = 0;
+            var decoded_href: [128]u8 = undefined;
+            var decoded_href_len: u8 = 0;
+            try copyValue(id, &decoded_id, &decoded_id_len);
+            try copyValue(href, &decoded_href, &decoded_href_len);
             const item = &workspace.manifest[workspace.manifest_len];
-            try copyValue(id, &item.id, &item.id_len);
-            try copyValue(href, &item.href, &item.href_len);
-            item.is_readable = std.mem.eql(u8, media_type, "application/xhtml+xml");
-            item.is_navigation_document = propertiesContain(attribute(element.attributes, "properties"), "nav");
+            item.id_offset = packageValueOffset(xml, id);
+            item.id_len = @intCast(id.len);
+            item.href_offset = packageValueOffset(xml, href);
+            item.href_len = @intCast(href.len);
+            item.is_readable = is_readable;
+            item.is_navigation_document = is_navigation_document;
+            item.is_ncx_document = is_ncx_document;
             workspace.manifest_len += 1;
         }
     }
 
     for (workspace.manifest[0..workspace.manifest_len]) |*item| {
-        if (item.is_navigation_document) setNavigationSource(&publication.navigation_document, prefix, item.href[0..item.href_len]);
+        if (!item.is_navigation_document) continue;
+        var href_buffer: [128]u8 = undefined;
+        const href = decodedManifestHref(xml, item, &href_buffer) catch continue;
+        setNavigationSource(&publication.navigation_document, prefix, href);
     }
 
     cursor = 0;
@@ -132,16 +174,20 @@ pub fn parseOpf(xml: []const u8, package_path: []const u8, publication: *Publica
         if (!std.mem.eql(u8, name, "itemref")) continue;
         const raw_idref = attribute(element.attributes, "idref") orelse return error.MalformedXml;
         try copyValue(raw_idref, &idref_buffer, &idref_len);
-        const item = findManifestItem(workspace, idref_buffer[0..idref_len]) orelse return error.MissingManifestItem;
+        const item = findManifestItem(xml, workspace, idref_buffer[0..idref_len]) orelse return error.MissingManifestItem;
         if (!item.is_readable) return error.MissingManifestItem;
         if (publication.spine_len == max_spine_items) return error.CapacityExceeded;
         const spine_entry = &publication.spine[publication.spine_len];
-        try joinPath(prefix, item.href[0..item.href_len], &spine_entry.path, &spine_entry.path_len);
+        var href_buffer: [128]u8 = undefined;
+        const href = try decodedManifestHref(xml, item, &href_buffer);
+        try joinPath(prefix, href, &spine_entry.path, &spine_entry.path_len);
         publication.spine_len += 1;
     }
     if (publication.spine_len == 0) return error.MalformedXml;
-    if (findManifestItem(workspace, ncx_id[0..ncx_id_len])) |item| {
-        setNavigationSource(&publication.ncx_document, prefix, item.href[0..item.href_len]);
+    if (findManifestItem(xml, workspace, ncx_id[0..ncx_id_len])) |item| {
+        var href_buffer: [128]u8 = undefined;
+        const href = try decodedManifestHref(xml, item, &href_buffer);
+        setNavigationSource(&publication.ncx_document, prefix, href);
     }
 }
 
@@ -161,11 +207,28 @@ fn propertiesContain(properties: ?[]const u8, wanted: []const u8) bool {
     return false;
 }
 
-fn findManifestItem(workspace: *const OpfWorkspace, id: []const u8) ?*const ManifestItem {
+fn findManifestItem(xml: []const u8, workspace: *const OpfWorkspace, id: []const u8) ?*const ManifestItem {
     for (workspace.manifest[0..workspace.manifest_len]) |*item| {
-        if (std.mem.eql(u8, item.id[0..item.id_len], id)) return item;
+        var decoded: [64]u8 = undefined;
+        var decoded_len: u8 = 0;
+        copyValue(packageValue(xml, item.id_offset, item.id_len), &decoded, &decoded_len) catch continue;
+        if (std.mem.eql(u8, decoded[0..decoded_len], id)) return item;
     }
     return null;
+}
+
+fn decodedManifestHref(xml: []const u8, item: *const ManifestItem, destination: *[128]u8) Error![]const u8 {
+    var len: u8 = 0;
+    try copyValue(packageValue(xml, item.href_offset, item.href_len), destination, &len);
+    return destination[0..len];
+}
+
+fn packageValueOffset(xml: []const u8, value: []const u8) u32 {
+    return @intCast(@intFromPtr(value.ptr) - @intFromPtr(xml.ptr));
+}
+
+fn packageValue(xml: []const u8, offset: u32, len: u32) []const u8 {
+    return xml[offset .. offset + len];
 }
 
 pub fn packageDirectory(path: []const u8) []const u8 {

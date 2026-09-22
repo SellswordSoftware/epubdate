@@ -1,8 +1,9 @@
 const std = @import("std");
+const epub = @import("publication/epub.zig");
 
 /// The browser keeps indices into Publication's bounded spine list; it never
 /// copies chapter paths or retains a separate table of labels.
-pub const visible_rows: u8 = 10;
+pub const visible_rows: u8 = 9;
 
 pub const Model = struct {
     entry_count: u8 = 0,
@@ -44,9 +45,75 @@ pub const Model = struct {
 pub fn formatLabel(output: []u8, index: u8, navigation_label: []const u8, path: []const u8) []const u8 {
     const prefix = std.fmt.bufPrint(output, "{d}. ", .{@as(u16, index) + 1}) catch return "";
     const text = if (navigation_label.len != 0) navigation_label else withoutMarkupExtension(basename(path));
-    const copied = @min(output.len - prefix.len, text.len);
-    @memcpy(output[prefix.len .. prefix.len + copied], text[0..copied]);
-    return output[0 .. prefix.len + copied];
+    var output_len = prefix.len;
+    appendNormalized(output, &output_len, text);
+    return output[0..output_len];
+}
+
+/// Computes one allocation-free browser boundary from already-parsed EPUB
+/// navigation metadata. The complete spine remains untouched.
+pub const Visibility = struct {
+    final_labeled_spine: ?u8,
+
+    pub fn init(publication: *const epub.Publication) Visibility {
+        var index = publication.spine_len;
+        while (index != 0) {
+            index -= 1;
+            if (publication.chapter_labels[index].len != 0) return .{ .final_labeled_spine = index };
+        }
+        return .{ .final_labeled_spine = null };
+    }
+
+    pub fn includes(self: Visibility, publication: *const epub.Publication, index: u8) bool {
+        if (index >= publication.spine_len) return false;
+        if (isGutenbergCoverWrapper(publication.spine[index].slice())) return false;
+        return if (self.final_labeled_spine) |last| index <= last else true;
+    }
+};
+
+fn isGutenbergCoverWrapper(path: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(withoutMarkupExtension(basename(path)), "wrap0000");
+}
+
+fn appendNormalized(output: []u8, output_len: *usize, text: []const u8) void {
+    var source_index: usize = 0;
+    while (source_index < text.len and output_len.* < output.len) {
+        const byte = text[source_index];
+        if (byte < 0x80) {
+            appendBytes(output, output_len, &[_]u8{byte});
+            source_index += 1;
+            continue;
+        }
+        const sequence_len: usize = std.unicode.utf8ByteSequenceLength(byte) catch {
+            appendBytes(output, output_len, "?");
+            source_index += 1;
+            continue;
+        };
+        if (sequence_len > text.len - source_index) {
+            appendBytes(output, output_len, "?");
+            break;
+        }
+        const codepoint = std.unicode.utf8Decode(text[source_index .. source_index + sequence_len]) catch {
+            appendBytes(output, output_len, "?");
+            source_index += 1;
+            continue;
+        };
+        appendBytes(output, output_len, switch (codepoint) {
+            0x2018, 0x2019 => "'",
+            0x201c, 0x201d => "\"",
+            0x2013 => "-",
+            0x2014 => "--",
+            0x2026 => "...",
+            else => "?",
+        });
+        source_index += sequence_len;
+    }
+}
+
+fn appendBytes(output: []u8, output_len: *usize, bytes: []const u8) void {
+    const copied = @min(output.len - output_len.*, bytes.len);
+    @memcpy(output[output_len.* .. output_len.* + copied], bytes[0..copied]);
+    output_len.* += copied;
 }
 
 fn basename(path: []const u8) []const u8 {
@@ -74,10 +141,10 @@ test "browser model keeps the selected chapter inside its viewport" {
     var browser = Model.init(18, 0);
     browser.move(10);
     try std.testing.expectEqual(@as(u8, 10), browser.selected);
-    try std.testing.expectEqual(@as(u8, 1), browser.first_visible);
+    try std.testing.expectEqual(@as(u8, 2), browser.first_visible);
     browser.move(7);
     try std.testing.expectEqual(@as(u8, 17), browser.selected);
-    try std.testing.expectEqual(@as(u8, 8), browser.first_visible);
+    try std.testing.expectEqual(@as(u8, 9), browser.first_visible);
     browser.move(-99);
     try std.testing.expectEqual(@as(u8, 0), browser.selected);
     try std.testing.expectEqual(@as(u8, 0), browser.first_visible);
@@ -86,8 +153,8 @@ test "browser model keeps the selected chapter inside its viewport" {
 test "browser model opens at a final current chapter and coalesces beyond both bounds" {
     var browser = Model.init(18, 17);
     try std.testing.expectEqual(@as(u8, 17), browser.selected);
-    try std.testing.expectEqual(@as(u8, 8), browser.first_visible);
-    try std.testing.expectEqual(@as(u8, 10), browser.displayedCount());
+    try std.testing.expectEqual(@as(u8, 9), browser.first_visible);
+    try std.testing.expectEqual(@as(u8, 9), browser.displayedCount());
     browser.move(120);
     try std.testing.expectEqual(@as(u8, 17), browser.selected);
     browser.move(-120);
@@ -115,4 +182,42 @@ test "browser label prefers a bounded EPUB navigation label" {
     var output: [13]u8 = undefined;
     try std.testing.expectEqualStrings("2. TRANSLATOR", formatLabel(&output, 1, "TRANSLATOR’S PREFACE", "nonsense.xhtml"));
     try std.testing.expectEqualStrings("2. nonsense", formatLabel(&output, 1, "", "nonsense.xhtml"));
+}
+
+test "browser labels normalize display punctuation" {
+    var output: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("1. Don't--wait...", formatLabel(&output, 0, "Don’t—wait…", "ignored.xhtml"));
+}
+
+test "TOC boundary preserves gaps and fallback while hiding trailing entries" {
+    var publication: epub.Publication = undefined;
+    @memset(std.mem.asBytes(&publication), 0);
+    const paths = [_][]const u8{
+        "OEBPS/wrap0000.xhtml",
+        "OEBPS/chapter0001.xhtml",
+        "OEBPS/unlisted-middle.xhtml",
+        "OEBPS/chapter0003.xhtml",
+        "OEBPS/image-wrapper-1.xhtml",
+        "OEBPS/image-wrapper-2.xhtml",
+    };
+    publication.spine_len = @intCast(paths.len);
+    for (paths, 0..) |path, index| {
+        publication.spine[index].path_len = @intCast(path.len);
+        @memcpy(publication.spine[index].path[0..path.len], path);
+    }
+    publication.chapter_labels[1].len = 1;
+    publication.chapter_labels[3].len = 1;
+
+    const bounded = Visibility.init(&publication);
+    try std.testing.expect(!bounded.includes(&publication, 0));
+    try std.testing.expect(bounded.includes(&publication, 1));
+    try std.testing.expect(bounded.includes(&publication, 2));
+    try std.testing.expect(bounded.includes(&publication, 3));
+    try std.testing.expect(!bounded.includes(&publication, 4));
+    try std.testing.expect(!bounded.includes(&publication, 5));
+
+    @memset(std.mem.asBytes(&publication.chapter_labels), 0);
+    const fallback = Visibility.init(&publication);
+    try std.testing.expect(fallback.includes(&publication, 4));
+    try std.testing.expect(!fallback.includes(&publication, 0));
 }

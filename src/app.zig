@@ -25,12 +25,19 @@ pub const App = struct {
     // Progress indexing owns an independent stream and decoder workspace.
     progress_file: ?PlaydateFileReader = null,
     telemetry_menu: ?*pdapi.PDMenuItem = null,
+    chapters_menu: ?*pdapi.PDMenuItem = null,
+    settings_menu: ?*pdapi.PDMenuItem = null,
+    chapters_menu_visible: bool = false,
 
     pub fn init(playdate: *pdapi.PlaydateAPI, allocator: *PlaydateAllocator) !*App {
         const newsleak_serif_font = playdate.graphics.loadFont("assets/fonts/Newsleak-Serif.pft", null) orelse return error.FontLoadFailed;
         const newsleak_serif_bold_font = playdate.graphics.loadFont("assets/fonts/Newsleak-Serif-Bold.pft", null) orelse return error.FontLoadFailed;
         const sasser_slab_font = playdate.graphics.loadFont("assets/fonts/Sasser-Slab.pft", null) orelse return error.FontLoadFailed;
         const asheville_sans_font = playdate.graphics.loadFont("assets/fonts/Asheville-Sans-14-Bold.pft", null) orelse return error.FontLoadFailed;
+        const espy_serif_3_font = playdate.graphics.loadFont("assets/fonts/EspySerif-3.pft", null) orelse return error.FontLoadFailed;
+        const espy_serif_4_font = playdate.graphics.loadFont("assets/fonts/EspySerif-4.pft", null) orelse return error.FontLoadFailed;
+        const espy_sans_5_font = playdate.graphics.loadFont("assets/fonts/EspySans-5.pft", null) orelse return error.FontLoadFailed;
+        const literata_36pt_medium_30_font = playdate.graphics.loadFont("assets/fonts/Literata36pt-Medium-30.pft", null) orelse return error.FontLoadFailed;
         const roobert_11_bold_font = playdate.graphics.loadFont("/System/Fonts/Roobert-11-Bold.pft", null) orelse return error.FontLoadFailed;
         const roobert_20_medium_font = playdate.graphics.loadFont("/System/Fonts/Roobert-20-Medium.pft", null) orelse return error.FontLoadFailed;
         const roobert_24_medium_font = playdate.graphics.loadFont("/System/Fonts/Roobert-24-Medium.pft", null) orelse return error.FontLoadFailed;
@@ -43,6 +50,10 @@ pub const App = struct {
             newsleak_serif_bold_font,
             sasser_slab_font,
             asheville_sans_font,
+            espy_serif_3_font,
+            espy_serif_4_font,
+            espy_sans_5_font,
+            literata_36pt_medium_30_font,
             roobert_11_bold_font,
             roobert_20_medium_font,
             roobert_24_medium_font,
@@ -52,6 +63,9 @@ pub const App = struct {
         app.prefetch_file = null;
         app.progress_file = null;
         app.telemetry_menu = null;
+        app.chapters_menu = null;
+        app.settings_menu = null;
+        app.chapters_menu_visible = false;
         app.coordinator.initInPlace(reader_coordinator.default_checkpoint_byte_budget);
         app.coordinator.attachAllocator(allocator.allocator());
         app.coordinator.attachPersistence(persistence.Service.init(playdate_persistence.fileStore(playdate.file)));
@@ -76,10 +90,12 @@ pub const App = struct {
             .a_held = current & pdapi.BUTTON_A != 0,
             .crank_change = self.playdate.system.getCrankChange(),
             .crank_docked = self.playdate.system.isCrankDocked() != 0,
+            .reduce_flashing = self.playdate.system.getReduceFlashing() != 0,
         }, started_at);
+        self.syncSystemMenu();
 
         self.renderer.beginFrame(self.coordinator.theme, self.coordinator.pages_font, self.coordinator.rsvp_font);
-        self.renderer.draw(self.coordinator.renderModel());
+        self.renderer.draw(self.coordinator.renderModel(), self.allocator.stats);
         if (self.coordinator.telemetrySnapshot()) |snapshot| self.renderer.drawTelemetry(snapshot, self.allocator.stats);
         return 1;
     }
@@ -110,10 +126,25 @@ pub const App = struct {
     }
 
     fn installSystemMenu(self: *App) void {
-        _ = self.playdate.system.addMenuItem("Library", libraryMenuSelected, self);
-        _ = self.playdate.system.addMenuItem("Settings", settingsMenuSelected, self);
-        _ = self.playdate.system.addMenuItem("Chapters", chaptersMenuSelected, self);
-        self.telemetry_menu = self.playdate.system.addCheckmarkMenuItem("Telemetry", 0, telemetryMenuSelected, self);
+        self.settings_menu = self.playdate.system.addMenuItem("Settings", settingsMenuSelected, self);
+        // Retain telemetry wiring for later diagnostics without exposing it
+        // in the current player-facing system menu.
+        // self.telemetry_menu = self.playdate.system.addCheckmarkMenuItem("Telemetry", 0, telemetryMenuSelected, self);
+    }
+
+    fn syncSystemMenu(self: *App) void {
+        const chapters_visible = self.coordinator.chaptersMenuAvailable();
+        if (chapters_visible == self.chapters_menu_visible) return;
+        self.chapters_menu_visible = chapters_visible;
+
+        if (chapters_visible) {
+            self.playdate.system.removeMenuItem(self.settings_menu);
+            self.chapters_menu = self.playdate.system.addMenuItem("Chapters", chaptersMenuSelected, self);
+            self.settings_menu = self.playdate.system.addMenuItem("Settings", settingsMenuSelected, self);
+        } else {
+            self.playdate.system.removeMenuItem(self.chapters_menu);
+            self.chapters_menu = null;
+        }
     }
 
     fn closeOpeningFile(self: *App) void {
@@ -208,11 +239,6 @@ fn telemetryMenuSelected(userdata: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(userdata orelse return));
     const item = app.telemetry_menu orelse return;
     app.coordinator.setTelemetryEnabled(app.playdate.system.getMenuItemValue(item) != 0);
-}
-
-fn libraryMenuSelected(userdata: ?*anyopaque) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(userdata orelse return));
-    app.coordinator.handleSystemAction(.library, app.playdate.system.getCurrentTimeMilliseconds());
 }
 
 fn chaptersMenuSelected(userdata: ?*anyopaque) callconv(.c) void {

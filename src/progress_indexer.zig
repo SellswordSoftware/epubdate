@@ -134,7 +134,12 @@ pub const Indexer = struct {
     pub fn close(self: *Indexer) void {
         self.releaseFile();
         self.clearJobs();
+        self.index = null;
         self.publication = null;
+        self.current_chapter = 0;
+        self.dirty = false;
+        self.last_failure = null;
+        self.decoded_last_update = 0;
         self.phase = .idle;
     }
 

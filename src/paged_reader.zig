@@ -164,6 +164,13 @@ pub const PagedReader = struct {
         return reader;
     }
 
+    /// Clears all presentation and reconstruction state at a book boundary
+    /// while preserving the configured checkpoint budget.
+    pub fn resetForBook(self: *PagedReader) void {
+        const checkpoint_byte_budget = self.checkpoints.byte_budget;
+        self.initInPlace(checkpoint_byte_budget);
+    }
+
     pub fn begin(self: *PagedReader, chapter: u8, width: usize, measure: pagination.Measure) void {
         self.chapter_index = chapter;
         self.page_index = 0;
@@ -215,6 +222,13 @@ pub const PagedReader = struct {
     pub fn current(self: *const PagedReader) ?*const pagination.PageCache {
         if (!self.current_ready) return null;
         return &self.pages[self.current_page];
+    }
+
+    /// Borrows an already-cached page for a short renderer transition. It
+    /// never changes cache roles or pins storage.
+    pub fn cachedPage(self: *const PagedReader, page: u32) ?*const pagination.PageCache {
+        const slot = self.findCachedPage(page) orelse return null;
+        return &self.pages[slot];
     }
 
     /// Data-only rendering input.  The Playdate façade decides how to draw

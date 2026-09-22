@@ -24,6 +24,7 @@ const reader_host = @import("reader_host.zig");
 const reader_transitions = @import("reader_transitions.zig");
 const reader_layout = @import("reader_layout.zig");
 const scroll_geometry = @import("scroll_geometry.zig");
+const page_transition = @import("page_transition.zig");
 
 const prefetch_directory_records_per_step: usize = 8;
 const layout_revision: u16 = 1;
@@ -83,13 +84,14 @@ pub const Screen = enum {
 pub const ReadingMode = enum { paged, rsvp };
 pub const Theme = persistence.Theme;
 pub const ReadingFont = persistence.ReadingFont;
+pub const library_visible_rows = library_storage.visible_rows;
 pub const ProgressVisibility = persistence.ProgressVisibility;
 pub const ProgressPosition = persistence.ProgressPosition;
 pub const ProgressScope = persistence.ProgressScope;
 pub const PagedPresentation = persistence.PagedPresentation;
 pub const ProgressView = reading_progress.View;
 pub const SettingsRow = settings_menu.Row;
-pub const Readiness = enum { opening, ready, chapter_error };
+pub const Readiness = enum { opening, ready, opening_failure, chapter_error };
 pub const Lifecycle = enum {
     opening,
     ready,
@@ -98,6 +100,34 @@ pub const Lifecycle = enum {
     missing_mimetype,
     invalid_mimetype,
     chapter_error,
+};
+
+pub const OpeningFailure = union(enum) {
+    opening_allocation: usize,
+    archive_initialization: zip.Error,
+    archive_scan: struct {
+        cause: zip.Error,
+        file_size: u32,
+        tail_signature: [4]u8,
+        nonzero_through: ?u32,
+        zero_from: ?u32,
+    },
+    directory_validation: zip.Error,
+    directory_index,
+    container_lookup: zip.Error,
+    container_stream: zip.Error,
+    container_read: zip.Error,
+    container_buffer,
+    container_finish: zip.Error,
+    container_parse: epub.Error,
+    package_lookup: zip.Error,
+    package_size: u32,
+    package_allocation: u32,
+    package_stream: zip.Error,
+    package_read: zip.Error,
+    package_buffer,
+    package_finish: zip.Error,
+    package_parse: epub.Error,
 };
 pub const ChapterFailure = enum { archive, tokenizer, page_limit, no_supported_text };
 
@@ -128,9 +158,10 @@ pub const FrameInput = struct {
     a_held: bool = false,
     crank_change: f32 = 0,
     crank_docked: bool = false,
+    reduce_flashing: bool = false,
 };
 
-pub const SystemAction = enum { library, settings, chapters };
+pub const SystemAction = enum { settings, chapters };
 const PagedSelectionMove = enum { advanced, waiting_for_page, at_limit };
 
 /// Owns UI lifecycle transitions. Reader engines report readiness and semantic
@@ -142,12 +173,13 @@ pub const ReaderCoordinator = struct {
     paged_presentation: PagedPresentation = .pages,
     settings_menu_state: settings_menu.Model = .{},
     theme: Theme = .light,
-    pages_font: ReadingFont = .roobert_20_medium,
+    pages_font: ReadingFont = .newsleak_serif,
     rsvp_font: ReadingFont = .roobert_20_medium,
     progress_visibility: ProgressVisibility = .off,
     progress_position: ProgressPosition = .top,
     progress_scope: ProgressScope = .chapter,
     library: library_storage.Library = .{},
+    library_progress: [library_storage.capacity]?u8 = [_]?u8{null} ** library_storage.capacity,
     active_book: library_storage.Book = .{},
     pace: reading_pace.Stats = .{ .book_id = 0 },
     manual_pace: reading_pace.ManualSampler = .{},
@@ -157,7 +189,7 @@ pub const ReaderCoordinator = struct {
     paged: paged_reader.PagedReader,
     rsvp_reader: rsvp_reader.RsvpReader,
     decode_workspace: decode_workspace.DecodeWorkspace = .{},
-    opening_job: ?opening_session.Session = null,
+    opening_job: ?*opening_session.Session = null,
     /// A successful opener asks the platform façade to begin this chapter.
     /// The façade supplies only the stable chapter file lease; it does not
     /// decide whether opening succeeded or which navigation fallback won.
@@ -171,8 +203,14 @@ pub const ReaderCoordinator = struct {
     pending_prefetch_transition: ?u8 = null,
     scroll_align_chapter_end: bool = false,
     lifecycle: Lifecycle = .opening,
+    opening_failure: OpeningFailure = .{ .archive_scan = .{
+        .cause = error.InvalidCentralDirectory,
+        .file_size = 0,
+        .tail_signature = [_]u8{0} ** 4,
+        .nonzero_through = null,
+        .zero_from = null,
+    } },
     chapter_failure: ChapterFailure = .archive,
-    zip_entries: [epub.max_manifest_items]zip.IndexedEntry = undefined,
     archive_index: ?zip.DirectoryIndex = null,
     publication: epub.Publication = undefined,
     archive_scan_buffer: [1024]u8 = undefined,
@@ -189,6 +227,9 @@ pub const ReaderCoordinator = struct {
     telemetry: telemetry.Telemetry = .{},
     crank_accumulated: f32 = 0,
     scroll_crank_millidegrees: i32 = 0,
+    page_transition_state: page_transition.State = .{},
+    restore_transition_pending: bool = false,
+    frame_now_ms: u32 = 0,
     crank_docked: bool = false,
     reset_hold_started_at: ?u32 = null,
     reset_hold_elapsed_ms: u16 = 0,
@@ -207,12 +248,13 @@ pub const ReaderCoordinator = struct {
         self.paged_presentation = .pages;
         self.settings_menu_state = .{};
         self.theme = .light;
-        self.pages_font = .roobert_20_medium;
+        self.pages_font = .newsleak_serif;
         self.rsvp_font = .roobert_20_medium;
         self.progress_visibility = .off;
         self.progress_position = .top;
         self.progress_scope = .chapter;
         self.library = .{};
+        self.library_progress = [_]?u8{null} ** library_storage.capacity;
         self.active_book = .{};
         self.pace = .{ .book_id = 0 };
         self.manual_pace = .{};
@@ -233,6 +275,13 @@ pub const ReaderCoordinator = struct {
         self.pending_prefetch_transition = null;
         self.scroll_align_chapter_end = false;
         self.lifecycle = .opening;
+        self.opening_failure = .{ .archive_scan = .{
+            .cause = error.InvalidCentralDirectory,
+            .file_size = 0,
+            .tail_signature = [_]u8{0} ** 4,
+            .nonzero_through = null,
+            .zero_from = null,
+        } };
         self.chapter_failure = .archive;
         self.archive_index = null;
         self.chapter_stream = null;
@@ -241,6 +290,9 @@ pub const ReaderCoordinator = struct {
         self.telemetry = .{};
         self.crank_accumulated = 0;
         self.scroll_crank_millidegrees = 0;
+        self.page_transition_state = .{};
+        self.restore_transition_pending = false;
+        self.frame_now_ms = 0;
         self.crank_docked = false;
         self.reset_hold_started_at = null;
         self.reset_hold_elapsed_ms = 0;
@@ -272,6 +324,43 @@ pub const ReaderCoordinator = struct {
         const files = self.host.?.files orelse return;
         self.library = .{};
         files.list_epubs(files.context, &self.library);
+        self.refreshLibraryProgress();
+    }
+
+    fn refreshLibraryProgress(self: *ReaderCoordinator) void {
+        self.library_progress = [_]?u8{null} ** library_storage.capacity;
+        const service = &(self.persistence orelse return);
+        for (self.library.books[0..self.library.len], 0..) |*book, index| {
+            const book_id = persistence.Service.bookIdentity(book.slice());
+            const restored = service.loadPosition(book_id, layout_revision) orelse continue;
+            const snapshot = switch (restored) {
+                .snapshot => |value| value,
+                .legacy_paged_page => continue,
+            };
+            if (snapshot.chapter > std.math.maxInt(u8)) continue;
+            const progress = service.loadLibraryProgress(book_id) orelse continue;
+            self.library_progress[index] = progress.bookPercent(.{
+                .chapter = @intCast(snapshot.chapter),
+                .word_ordinal = snapshot.word_ordinal,
+            });
+        }
+    }
+
+    /// Updates the selected card from the already-resident active-book index.
+    /// Leaving a book must not synchronously reopen every library sidecar.
+    fn refreshActiveLibraryProgress(self: *ReaderCoordinator) void {
+        const selected: usize = self.library.selected;
+        if (selected >= self.library.len) return;
+        if (self.position_save_suppressed) {
+            self.library_progress[selected] = null;
+            return;
+        }
+        const progress = self.progress_worker.snapshot() orelse return;
+        const snapshot = self.positionSnapshot();
+        self.library_progress[selected] = progress.bookPercent(.{
+            .chapter = @intCast(snapshot.chapter),
+            .word_ordinal = snapshot.word_ordinal,
+        });
     }
 
     pub fn attachPersistence(self: *ReaderCoordinator, service: persistence.Service) void {
@@ -283,8 +372,8 @@ pub const ReaderCoordinator = struct {
         self.mode = if (settings.reading_mode == .rsvp) .rsvp else .paged;
         self.rsvp_reader.wpm = settings.rsvp_wpm;
         self.theme = settings.theme;
-        self.pages_font = settings.pages_font;
-        self.rsvp_font = settings.rsvp_font;
+        self.pages_font = persistence.normalizePagesFont(settings.pages_font);
+        self.rsvp_font = persistence.normalizeRsvpFont(settings.rsvp_font);
         self.progress_visibility = settings.progress_visibility;
         self.progress_position = settings.progress_position;
         self.progress_scope = settings.progress_scope;
@@ -362,7 +451,10 @@ pub const ReaderCoordinator = struct {
             .legacy_paged_page => |legacy| {
                 if (legacy.chapter >= self.publication.spine_len) return;
                 const chapter: u8 = @intCast(legacy.chapter);
-                if (self.mode == .paged) self.openChapter(chapter, if (legacy.page == 0) .normal else .{ .rescan = legacy.page }) else self.openChapter(chapter, .normal);
+                if (self.mode == .paged) {
+                    self.restore_transition_pending = self.paged_presentation == .pages;
+                    self.openChapter(chapter, if (legacy.page == 0) .normal else .{ .rescan = legacy.page });
+                } else self.openChapter(chapter, .normal);
             },
             .snapshot => |snapshot| {
                 if (snapshot.chapter >= self.publication.spine_len) return;
@@ -370,6 +462,7 @@ pub const ReaderCoordinator = struct {
                 self.pending_mode_word_ordinal = snapshot.word_ordinal;
                 switch (self.mode) {
                     .paged => {
+                        self.restore_transition_pending = self.paged_presentation == .pages;
                         self.paged.pending_selection = .{ .ordinal = snapshot.word_ordinal };
                         self.openChapter(chapter, .{ .word_rescan = snapshot.word_ordinal });
                     },
@@ -424,6 +517,7 @@ pub const ReaderCoordinator = struct {
         self.flushPaceNow();
         if (self.lifecycle == .ready) self.flushPositionNow();
         self.flushProgressNow();
+        self.refreshActiveLibraryProgress();
         self.progress_worker.close();
         self.cancelOpening();
         self.cancelPrefetch();
@@ -437,17 +531,20 @@ pub const ReaderCoordinator = struct {
         self.paged.detent_backlog = 0;
         self.paged.clearScrollTransient();
         self.scroll_crank_millidegrees = 0;
+        self.page_transition_state.cancel();
+        self.restore_transition_pending = false;
         self.clearResetHold();
         self.returnToLibrary();
         self.lifecycle = .opening;
     }
 
     pub fn openSettings(self: *ReaderCoordinator) bool {
-        if (self.screen != .reading) return false;
+        if (self.screen != .reading and self.screen != .library) return false;
         self.manual_pace.discard();
         self.paged.clearScrollTransient();
         self.scroll_crank_millidegrees = 0;
         self.screen_before_settings = self.screen;
+        self.settings_menu_state.setAvailableRows(if (self.screen == .library) settings_menu.global_row_count else settings_menu.row_count);
         self.screen = .settings;
         return true;
     }
@@ -459,16 +556,17 @@ pub const ReaderCoordinator = struct {
         return true;
     }
 
-    pub fn openStatistics(self: *ReaderCoordinator) bool {
-        if (self.screen != .settings) return false;
-        self.clearResetHold();
+    pub fn openReadingStatistics(self: *ReaderCoordinator, now_ms: u32) bool {
+        if (self.screen != .reading) return false;
+        self.manual_pace.discard();
+        self.stopAutoplayAccounting(now_ms);
         self.screen = .statistics;
         return true;
     }
 
     pub fn closeStatistics(self: *ReaderCoordinator) bool {
         if (self.screen != .statistics) return false;
-        self.screen = .settings;
+        self.screen = .reading;
         return true;
     }
 
@@ -534,6 +632,39 @@ pub const ReaderCoordinator = struct {
         return true;
     }
 
+    fn visibleChapterCount(self: *const ReaderCoordinator) u8 {
+        const visibility = chapter_browser.Visibility.init(&self.publication);
+        var count: u8 = 0;
+        for (0..self.publication.spine_len) |index| {
+            if (visibility.includes(&self.publication, @intCast(index))) count += 1;
+        }
+        return count;
+    }
+
+    fn browserPositionForSpine(self: *const ReaderCoordinator, spine_index: u8) u8 {
+        const visibility = chapter_browser.Visibility.init(&self.publication);
+        var position: u8 = 0;
+        var last_visible: u8 = 0;
+        for (0..self.publication.spine_len) |index| {
+            if (!visibility.includes(&self.publication, @intCast(index))) continue;
+            if (index >= spine_index) return position;
+            last_visible = position;
+            position += 1;
+        }
+        return last_visible;
+    }
+
+    fn spineIndexForBrowserPosition(self: *const ReaderCoordinator, wanted: u8) ?u8 {
+        const visibility = chapter_browser.Visibility.init(&self.publication);
+        var position: u8 = 0;
+        for (0..self.publication.spine_len) |index| {
+            if (!visibility.includes(&self.publication, @intCast(index))) continue;
+            if (position == wanted) return @intCast(index);
+            position += 1;
+        }
+        return null;
+    }
+
     pub fn selectBook(self: *ReaderCoordinator) ?*const library_storage.Book {
         const selected = self.library.selectedBook() orelse return null;
         self.active_book = selected.*;
@@ -543,13 +674,27 @@ pub const ReaderCoordinator = struct {
     /// Starts a fresh opening workflow for the selected library entry.
     pub fn openSelectedBook(self: *ReaderCoordinator) bool {
         _ = self.selectBook() orelse return false;
+        const allocator = self.allocator orelse return false;
+        const opening_job = allocator.create(opening_session.Session) catch {
+            self.opening_failure = .{ .opening_allocation = @sizeOf(opening_session.Session) };
+            self.lifecycle = .invalid_archive;
+            self.beginOpening();
+            return true;
+        };
+        opening_job.* = opening_session.Session.start();
         self.progress_worker.close();
+        self.paged.resetForBook();
+        self.rsvp_reader.resetForBook();
+        self.page_transition_state.cancel();
+        self.restore_transition_pending = false;
         self.position_save_suppressed = false;
         self.clearResetHold();
-        if (self.persistence) |*service| self.pace = service.loadPace(persistence.Service.bookIdentity(self.active_book.slice()));
+        const book_id = persistence.Service.bookIdentity(self.active_book.slice());
+        self.pace = if (self.persistence) |*service| service.loadPace(book_id) else .{ .book_id = book_id };
         self.lifecycle = .opening;
         self.beginOpening();
-        self.opening_job = opening_session.Session.start();
+        self.archive_index = null;
+        self.opening_job = opening_job;
         self.opening_chapter_request = null;
         return true;
     }
@@ -557,7 +702,7 @@ pub const ReaderCoordinator = struct {
     /// Advances a bounded opening phase owned by the coordinator. Later
     /// metadata phases remain bounded and are migrated separately.
     pub fn advanceOpening(self: *ReaderCoordinator) void {
-        const job = &(self.opening_job orelse return);
+        const job = self.opening_job orelse return;
         switch (job.phase) {
             .open => {
                 const files = self.host.?.files orelse {
@@ -568,25 +713,34 @@ pub const ReaderCoordinator = struct {
                     self.failOpening(.unavailable);
                     return;
                 };
-                job.beginArchiveScan(.{ .context = self, .close = closeOpeningHostLease }, reader) catch {
-                    self.failOpening(.invalid_archive);
+                job.beginArchiveScan(.{ .context = self, .close = closeOpeningHostLease }, reader) catch |err| {
+                    self.failInvalidOpening(.{ .archive_initialization = err });
                 };
             },
             .scan_archive => {
-                _ = job.stepArchiveScan() catch {
-                    self.failOpening(.invalid_archive);
+                _ = job.stepArchiveScan() catch |err| {
+                    self.failInvalidOpening(.{ .archive_scan = .{
+                        .cause = err,
+                        .file_size = job.scanner.?.reader.size,
+                        .tail_signature = job.scanner.?.tail_signature,
+                        .nonzero_through = if (job.scanner.?.read_boundary) |boundary| boundary.nonzero else null,
+                        .zero_from = if (job.scanner.?.read_boundary) |boundary| boundary.zero else null,
+                    } });
                 };
             },
             .validate_directory => {
-                const complete = job.stepDirectoryValidation() catch {
-                    self.failOpening(.invalid_archive);
-                    return;
-                };
-                if (!complete) return;
-                self.archive_index = job.copyDirectoryIndex(&self.zip_entries) catch {
-                    self.failOpening(.invalid_archive);
-                    return;
-                };
+                for (0..limits.opening_directory_records_per_update) |_| {
+                    const complete = job.stepDirectoryValidation() catch |err| {
+                        self.failInvalidOpening(.{ .directory_validation = err });
+                        return;
+                    };
+                    if (!complete) continue;
+                    self.archive_index = job.directoryIndex() catch {
+                        self.failInvalidOpening(.directory_index);
+                        return;
+                    };
+                    break;
+                }
             },
             .find_mimetype => {
                 const entry = self.archive_index.?.find("mimetype") catch {
@@ -597,7 +751,7 @@ pub const ReaderCoordinator = struct {
                     self.failOpening(.invalid_mimetype);
                 };
             },
-            .read_mimetype => if (self.advanceMetadataRead(job, .invalid_mimetype)) {
+            .read_mimetype => if (self.advanceMetadataReadBatch(job, .mimetype)) {
                 if (!job.mimetypeIsValid()) {
                     self.failOpening(.invalid_mimetype);
                     return;
@@ -605,67 +759,63 @@ pub const ReaderCoordinator = struct {
                 job.finishMetadataRead(.mimetype);
             },
             .find_container => {
-                const entry = self.archive_index.?.find("META-INF/container.xml") catch {
-                    self.failOpening(.invalid_archive);
+                const entry = self.archive_index.?.find("META-INF/container.xml") catch |err| {
+                    self.failInvalidOpening(.{ .container_lookup = err });
                     return;
                 };
-                self.beginMetadataRead(job, entry, .container) catch {
-                    self.failOpening(.invalid_archive);
+                self.beginMetadataRead(job, entry, .container) catch |err| {
+                    self.failInvalidOpening(.{ .container_stream = err });
                 };
             },
-            .read_container => if (self.advanceMetadataRead(job, .invalid_archive)) {
+            .read_container => if (self.advanceMetadataReadBatch(job, .container)) {
                 job.finishMetadataRead(.container);
             },
-            .parse_container => job.parseContainer() catch {
-                self.failOpening(.invalid_archive);
+            .parse_container => job.parseContainer() catch |err| {
+                self.failInvalidOpening(.{ .container_parse = err });
             },
             .find_package => {
-                const entry = self.archive_index.?.find(job.packagePath()) catch {
-                    self.failOpening(.invalid_archive);
+                const entry = self.archive_index.?.find(job.packagePath()) catch |err| {
+                    self.failInvalidOpening(.{ .package_lookup = err });
                     return;
                 };
                 if (entry.uncompressed_size == 0 or entry.uncompressed_size > epub.max_package_document_bytes) {
-                    self.failOpening(.invalid_archive);
+                    self.failInvalidOpening(.{ .package_size = entry.uncompressed_size });
                     return;
                 }
                 const allocator = self.allocator orelse {
-                    self.failOpening(.invalid_archive);
+                    self.failInvalidOpening(.{ .package_allocation = entry.uncompressed_size });
                     return;
                 };
                 job.package_xml = allocator.alloc(u8, entry.uncompressed_size) catch {
-                    self.failOpening(.invalid_archive);
+                    self.failInvalidOpening(.{ .package_allocation = entry.uncompressed_size });
                     return;
                 };
-                self.beginMetadataRead(job, entry, .package) catch {
-                    self.failOpening(.invalid_archive);
+                self.beginMetadataRead(job, entry, .package) catch |err| {
+                    self.failInvalidOpening(.{ .package_stream = err });
                 };
             },
-            .read_package => if (self.advanceMetadataRead(job, .invalid_archive)) {
+            .read_package => if (self.advanceMetadataReadBatch(job, .package)) {
                 job.finishMetadataRead(.package);
             },
             .parse_package => {
                 const package_xml = job.package_xml orelse {
-                    self.failOpening(.invalid_archive);
+                    self.failInvalidOpening(.package_buffer);
                     return;
                 };
                 const allocator = self.allocator orelse {
-                    self.failOpening(.invalid_archive);
+                    self.failInvalidOpening(.{ .package_allocation = @intCast(package_xml.len) });
                     return;
                 };
-                job.opf_workspace = allocator.create(epub.OpfWorkspace) catch {
-                    self.failOpening(.invalid_archive);
-                    return;
-                };
-                epub.parseOpf(package_xml[0..job.output_len], job.packagePath(), &self.publication, job.opf_workspace.?) catch {
-                    self.failOpening(.invalid_archive);
+                epub.parseOpf(package_xml[0..job.output_len], job.packagePath(), &self.publication, &job.opf_workspace) catch |err| {
+                    self.failInvalidOpening(.{ .package_parse = err });
                     return;
                 };
                 job.finishPackageParsing(allocator);
             },
             .find_navigation => self.beginNavigationRead(job, .epub3),
-            .read_navigation => self.advanceNavigationRead(job, .epub3),
+            .read_navigation => self.advanceNavigationReadBatch(job, .epub3),
             .find_ncx => self.beginNavigationRead(job, .ncx),
-            .read_ncx => self.advanceNavigationRead(job, .ncx),
+            .read_ncx => self.advanceNavigationReadBatch(job, .ncx),
         }
     }
 
@@ -728,6 +878,15 @@ pub const ReaderCoordinator = struct {
         }
     }
 
+    fn advanceNavigationReadBatch(self: *ReaderCoordinator, job: *opening_session.Session, source: opening_session.NavigationSource) void {
+        const reading_phase: opening_session.Phase = if (source == .epub3) .read_navigation else .read_ncx;
+        for (0..limits.opening_metadata_chunks_per_update) |_| {
+            self.advanceNavigationRead(job, source);
+            const active = self.opening_job orelse return;
+            if (active.phase != reading_phase) return;
+        }
+    }
+
     fn navigationSourceFinished(self: *ReaderCoordinator, source: opening_session.NavigationSource, has_labels: bool) void {
         const completion = self.opening_job.?.finishNavigation(source, has_labels);
         if (!has_labels) self.clearChapterLabels();
@@ -739,33 +898,30 @@ pub const ReaderCoordinator = struct {
     }
 
     fn finishOpening(self: *ReaderCoordinator) void {
-        const job = &(self.opening_job orelse return);
+        const job = self.opening_job orelse return;
         const result = job.takeResult() orelse return;
         switch (result) {
             .opened => {},
             .failed => unreachable,
         }
-        if (self.allocator) |allocator| {
-            job.cancel(allocator);
-        } else {
-            job.closeFileLease();
-        }
-        self.opening_job = null;
+        const fingerprint = if (self.archive_index) |*directory|
+            publicationFingerprint(&self.publication, directory)
+        else
+            [_]u8{0} ** 16;
+        self.releaseOpeningJob();
         self.chapter_index = 0;
-        self.startProgressIndexing();
-        self.archive_index = null;
+        self.startProgressIndexing(fingerprint);
         self.lifecycle = .ready;
         self.beginReading();
         self.opening_chapter_request = 0;
     }
 
-    fn startProgressIndexing(self: *ReaderCoordinator) void {
+    fn startProgressIndexing(self: *ReaderCoordinator, fingerprint: [16]u8) void {
         const host = self.host orelse return;
         const files = host.files orelse return;
-        const directory = if (self.archive_index) |*value| value else return;
         const key = reading_progress.Key{
             .book_id = self.bookIdentity(),
-            .publication_fingerprint = publicationFingerprint(&self.publication, directory),
+            .publication_fingerprint = fingerprint,
             .word_semantics_revision = word_semantics_revision,
             .spine_len = self.publication.spine_len,
         };
@@ -789,15 +945,20 @@ pub const ReaderCoordinator = struct {
     /// Cancels an in-flight opener without inventing an opening error. This
     /// is used when the user leaves for the library.
     pub fn cancelOpening(self: *ReaderCoordinator) void {
-        if (self.opening_job) |*job| {
-            if (self.allocator) |allocator| {
-                job.cancel(allocator);
-            } else {
-                job.closeFileLease();
-            }
+        self.releaseOpeningJob();
+        self.opening_chapter_request = null;
+    }
+
+    fn releaseOpeningJob(self: *ReaderCoordinator) void {
+        const job = self.opening_job orelse return;
+        if (self.allocator) |allocator| {
+            job.cancel(allocator);
+            allocator.destroy(job);
+        } else {
+            job.closeFileLease();
         }
         self.opening_job = null;
-        self.opening_chapter_request = null;
+        self.archive_index = null;
     }
 
     /// Begins a bounded chapter open through the stable chapter host slot.
@@ -851,13 +1012,19 @@ pub const ReaderCoordinator = struct {
             job.finder = zip.EntryFinder.init(archive, self.publication.spine[job.index].slice());
             return .{ .worked = true };
         }
-        const entry = job.finder.?.step(&self.archive_filename_buffer) catch {
-            self.failChapter(.archive);
-            return .{ .worked = true };
-        } orelse {
-            if (job.finder.?.entry_index == job.finder.?.archive.entry_count) self.failChapter(.archive);
-            return .{ .worked = true };
-        };
+        var matched_entry: ?zip.Entry = null;
+        for (0..limits.chapter_directory_records_per_update) |_| {
+            matched_entry = job.finder.?.step(&self.archive_filename_buffer) catch {
+                self.failChapter(.archive);
+                return .{ .worked = true };
+            };
+            if (matched_entry != null) break;
+            if (job.finder.?.entry_index == job.finder.?.archive.entry_count) {
+                self.failChapter(.archive);
+                return .{ .worked = true };
+            }
+        }
+        const entry = matched_entry orelse return .{ .worked = true };
         const archive = job.finder.?.archive;
         const index = job.index;
         const action = job.action;
@@ -1246,42 +1413,62 @@ pub const ReaderCoordinator = struct {
         job.beginMetadataRead(target);
     }
 
-    fn advanceMetadataRead(self: *ReaderCoordinator, job: *opening_session.Session, failure: Lifecycle) bool {
-        const result = job.stream.?.read(&job.output) catch {
-            self.failOpening(failure);
+    fn advanceMetadataRead(self: *ReaderCoordinator, job: *opening_session.Session, target: opening_session.MetadataTarget) bool {
+        const result = job.stream.?.read(&job.output) catch |err| {
+            self.failMetadataOpening(target, .read, err);
             return false;
         };
         switch (result) {
             .bytes => |count| {
                 job.appendMetadataBytes(job.output[0..count]) catch {
-                    self.failOpening(failure);
+                    switch (target) {
+                        .mimetype => self.failOpening(.invalid_mimetype),
+                        .container => self.failInvalidOpening(.container_buffer),
+                        .package => self.failInvalidOpening(.package_buffer),
+                    }
                 };
                 return false;
             },
             .end => {
-                job.stream.?.finish() catch {
-                    self.failOpening(failure);
+                job.stream.?.finish() catch |err| {
+                    self.failMetadataOpening(target, .finish, err);
                     return false;
                 };
                 return true;
             },
             .needs_input => {
-                self.failOpening(failure);
+                self.failMetadataOpening(target, .read, error.InflateFailed);
                 return false;
             },
         }
     }
 
+    fn advanceMetadataReadBatch(self: *ReaderCoordinator, job: *opening_session.Session, target: opening_session.MetadataTarget) bool {
+        for (0..limits.opening_metadata_chunks_per_update) |_| {
+            if (self.advanceMetadataRead(job, target)) return true;
+            if (self.opening_job == null) return false;
+        }
+        return false;
+    }
+
+    const MetadataFailureOperation = enum { read, finish };
+
+    fn failMetadataOpening(self: *ReaderCoordinator, target: opening_session.MetadataTarget, operation: MetadataFailureOperation, err: zip.Error) void {
+        switch (target) {
+            .mimetype => self.failOpening(.invalid_mimetype),
+            .container => self.failInvalidOpening(if (operation == .read) .{ .container_read = err } else .{ .container_finish = err }),
+            .package => self.failInvalidOpening(if (operation == .read) .{ .package_read = err } else .{ .package_finish = err }),
+        }
+    }
+
+    fn failInvalidOpening(self: *ReaderCoordinator, detail: OpeningFailure) void {
+        self.opening_failure = detail;
+        self.failOpening(.invalid_archive);
+    }
+
     fn failOpening(self: *ReaderCoordinator, failure: Lifecycle) void {
         self.manual_pace.discard();
-        if (self.opening_job) |*job| {
-            if (self.allocator) |allocator| {
-                job.cancel(allocator);
-            } else {
-                job.closeFileLease();
-            }
-        }
-        self.opening_job = null;
+        self.releaseOpeningJob();
         self.opening_chapter_request = null;
         self.lifecycle = failure;
     }
@@ -1290,10 +1477,12 @@ pub const ReaderCoordinator = struct {
     /// bounded workflows, and due persistence. Time and input are plain data;
     /// all platform I/O remains behind ReaderHost.
     pub fn update(self: *ReaderCoordinator, frame: FrameInput, now_ms: u32) void {
+        self.frame_now_ms = now_ms;
+        const transition_from = self.pagedFramePosition();
         self.updateCrankDockState(frame.crank_docked);
         const intent = intentFor(.{
             .screen = self.screen,
-            .readiness = if (self.lifecycle == .chapter_error) .chapter_error else if (self.lifecycle == .opening) .opening else .ready,
+            .readiness = if (self.lifecycle == .chapter_error) .chapter_error else if (self.lifecycle == .opening) .opening else if (self.lifecycle == .ready) .ready else .opening_failure,
             .mode = self.mode,
             .paged_presentation = if (self.paged_presentation == .scroll) .scroll else .pages,
             .buttons = frame.buttons,
@@ -1321,11 +1510,48 @@ pub const ReaderCoordinator = struct {
         self.stepProgressIndex(chapter.worked or prefetch_worked);
         self.syncManualPace(now_ms);
         self.flushPersistence();
+        self.updatePageTransition(transition_from, frame.reduce_flashing, now_ms);
+    }
+
+    const PagedFramePosition = struct { chapter: u8, page: u32 };
+
+    fn pagedFramePosition(self: *const ReaderCoordinator) ?PagedFramePosition {
+        if (self.screen != .reading or self.lifecycle != .ready or self.mode != .paged or self.paged_presentation != .pages or !self.paged.current_ready) return null;
+        return .{ .chapter = self.chapter_index, .page = self.paged.page_index };
+    }
+
+    fn updatePageTransition(self: *ReaderCoordinator, before: ?PagedFramePosition, reduce_flashing: bool, now_ms: u32) void {
+        if (self.restore_transition_pending) {
+            if (self.screen != .reading or self.lifecycle != .ready or self.mode != .paged or self.paged_presentation != .pages) {
+                self.restore_transition_pending = false;
+                self.page_transition_state.cancel();
+                return;
+            }
+            _ = self.pagedFramePosition() orelse return;
+            if (self.chapter_open != null or self.paged.isReconstructing() or self.paged.pending_selection != null) return;
+            self.restore_transition_pending = false;
+            if (reduce_flashing) {
+                self.page_transition_state.cancel();
+            } else self.page_transition_state.begin(null, .forward, now_ms);
+            return;
+        }
+        const after = self.pagedFramePosition() orelse {
+            self.page_transition_state.cancel();
+            return;
+        };
+        if (reduce_flashing) {
+            self.page_transition_state.cancel();
+            return;
+        }
+        const from = before orelse return;
+        if (from.chapter != after.chapter or from.page == after.page) return;
+        if (self.paged.cachedPage(from.page) == null) return;
+        self.page_transition_state.begin(from.page, if (after.page > from.page) .forward else .backward, now_ms);
     }
 
     fn stepProgressIndex(self: *ReaderCoordinator, foreground_worked: bool) void {
         if (foreground_worked or self.screen != .reading or self.lifecycle != .ready) return;
-        if (self.chapter_open != null or self.chapterIsReconstructing()) return;
+        if (self.chapterIsReconstructing()) return;
         if (self.paged.pending_selection != null or self.paged.detent_backlog != 0 or self.pending_prefetch_transition != null) return;
 
         switch (self.progress_worker.update(progress_indexer.default_byte_budget)) {
@@ -1385,18 +1611,37 @@ pub const ReaderCoordinator = struct {
 
     pub fn handleSystemAction(self: *ReaderCoordinator, action: SystemAction, now_ms: u32) void {
         switch (action) {
-            .library => self.leaveBook(now_ms),
             .settings => {
                 if (self.screen == .reading) self.stopAutoplayAccounting(now_ms);
                 _ = self.openSettings();
             },
             .chapters => {
-                if (self.screen != .reading or self.publication.spine_len == 0) return;
+                if (!self.chaptersMenuAvailable()) return;
+                switch (self.screen) {
+                    .reading => {},
+                    .settings => {
+                        if (self.screen_before_settings != .reading) return;
+                        self.clearResetHold();
+                        self.screen = .reading;
+                    },
+                    .statistics, .chapter_browser, .chapter_error => self.screen = .reading,
+                    else => return,
+                }
                 self.stopAutoplayAccounting(now_ms);
                 self.crank_accumulated = 0;
-                _ = self.openChapters(self.publication.spine_len, self.chapter_index);
+                _ = self.openChapters(self.visibleChapterCount(), self.browserPositionForSpine(self.chapter_index));
             },
         }
+    }
+
+    pub fn chaptersMenuAvailable(self: *const ReaderCoordinator) bool {
+        if (self.lifecycle != .ready and self.lifecycle != .chapter_error) return false;
+        const screen_allows_chapters = switch (self.screen) {
+            .reading, .statistics, .chapter_browser, .chapter_error => true,
+            .settings => self.screen_before_settings == .reading,
+            else => false,
+        };
+        return screen_allows_chapters and self.visibleChapterCount() != 0;
     }
 
     fn performIntent(self: *ReaderCoordinator, intent: input.Intent, now_ms: u32) void {
@@ -1406,6 +1651,8 @@ pub const ReaderCoordinator = struct {
             .library_previous => self.library.move(-1),
             .open_selected_book => _ = self.openSelectedBook(),
             .return_to_library => self.leaveBook(now_ms),
+            .open_settings => _ = self.openSettings(),
+            .open_statistics => _ = self.openReadingStatistics(now_ms),
             .close_settings => _ = self.closeSettings(),
             .close_statistics => _ = self.closeStatistics(),
             .close_chapter_browser => {
@@ -1416,7 +1663,7 @@ pub const ReaderCoordinator = struct {
             .chapter_browser_previous => self.chapter_browser.move(-1),
             .open_browser_chapter => {
                 if (self.chapter_browser.entry_count == 0) return;
-                const selected = self.chapter_browser.selected;
+                const selected = self.spineIndexForBrowserPosition(self.chapter_browser.selected) orelse return;
                 self.crank_accumulated = 0;
                 self.beginReading();
                 self.openChapter(selected, .normal);
@@ -1425,12 +1672,7 @@ pub const ReaderCoordinator = struct {
             .settings_next => self.moveSettingsSelection(1),
             .settings_previous => self.moveSettingsSelection(-1),
             .activate_setting => switch (self.settings_menu_state.selected) {
-                .reading_mode => self.switchReadingMode(now_ms),
                 .paged_presentation => self.switchPagedPresentation(),
-                .rsvp_wpm => {
-                    _ = self.rsvp_reader.adjustWpm(1, now_ms, &self.pace);
-                    self.saveSettings();
-                },
                 .theme => {
                     self.theme = if (self.theme == .light) .dark else .light;
                     self.saveSettings();
@@ -1453,7 +1695,6 @@ pub const ReaderCoordinator = struct {
                     };
                     self.saveSettings();
                 },
-                .statistics => _ = self.openStatistics(),
                 .reset_progress => {},
             },
             .toggle_reading_mode => self.switchReadingMode(now_ms),
@@ -1493,8 +1734,6 @@ pub const ReaderCoordinator = struct {
                     if (changes_position) self.requestPositionSaveAfterReadingMovement();
                 }
             },
-            .scroll_forward => self.moveScroll(.forward, now_ms),
-            .scroll_backward => self.moveScroll(.backward, now_ms),
             .next_chapter => self.openAdjacentChapter(1),
             .previous_chapter => self.openAdjacentChapter(-1),
         }
@@ -1550,7 +1789,7 @@ pub const ReaderCoordinator = struct {
     }
 
     fn switchPagesFont(self: *ReaderCoordinator) void {
-        self.pages_font = persistence.nextReadingFont(self.pages_font);
+        self.pages_font = persistence.nextPagesFont(self.pages_font);
         self.saveSettings();
         if (self.lifecycle != .ready or self.mode != .paged) return;
 
@@ -1564,7 +1803,7 @@ pub const ReaderCoordinator = struct {
     }
 
     fn switchRsvpFont(self: *ReaderCoordinator) void {
-        self.rsvp_font = persistence.nextReadingFont(self.rsvp_font);
+        self.rsvp_font = persistence.nextRsvpFont(self.rsvp_font);
         self.saveSettings();
         // RSVP positions are word-based. Re-rendering with new metrics keeps
         // its ring and semantic cursor intact, while Pages/Scroll stay idle.
@@ -1597,6 +1836,10 @@ pub const ReaderCoordinator = struct {
     }
 
     fn handleCrank(self: *ReaderCoordinator, change: f32, now_ms: u32) void {
+        if (self.screen == .library) {
+            self.library.move(crankDetents(&self.crank_accumulated, change));
+            return;
+        }
         if (self.screen == .chapter_browser) {
             self.chapter_browser.move(crankDetents(&self.crank_accumulated, change));
             return;
@@ -1668,15 +1911,6 @@ pub const ReaderCoordinator = struct {
                 },
             }
         }
-    }
-
-    fn moveScroll(self: *ReaderCoordinator, direction: scroll_geometry.Direction, now_ms: u32) void {
-        if (self.screen != .reading or self.mode != .paged or self.paged_presentation != .scroll or self.lifecycle != .ready or self.chapter_open != null) return;
-        const anchor = self.visibleManualPaceAnchor();
-        const before = self.currentPagedWordOrdinal();
-        if (direction == .backward) self.manual_pace.discard();
-        self.handleScrollMove(self.paged.scrollViewport(direction, self.scrollGeometry()));
-        if (direction == .forward) self.recordScrollForward(anchor, before, now_ms);
     }
 
     fn moveScrollPixels(self: *ReaderCoordinator, direction: scroll_geometry.Direction, pixels: u16, now_ms: u32) void {
@@ -1802,16 +2036,21 @@ pub const ReaderCoordinator = struct {
         switch (self.screen) {
             .library => {
                 var paths = [_][]const u8{""} ** library_storage.capacity;
-                for (self.library.books[0..self.library.len], 0..) |*book, index| paths[index] = book.slice();
-                return .{ .library = .{ .paths = paths, .count = self.library.len, .selected = self.library.selected } };
+                for (self.library.books[0..self.library.len], 0..) |*book, index| paths[index] = library_storage.displayTitle(book.slice());
+                return .{ .library = .{
+                    .paths = paths,
+                    .progress = self.library_progress,
+                    .count = self.library.len,
+                    .selected = self.library.selected,
+                    .first_visible = self.library.first_visible,
+                } };
             },
             .settings => return .{ .settings = .{
                 .selected = self.settings_menu_state.selected,
                 .first_visible = self.settings_menu_state.first_visible,
                 .row_count = self.settings_menu_state.displayedCount(),
-                .mode = self.mode,
+                .total_rows = self.settings_menu_state.available_rows,
                 .paged_presentation = self.paged_presentation,
-                .wpm = self.rsvp_reader.wpm,
                 .theme = self.theme,
                 .pages_font = self.pages_font,
                 .rsvp_font = self.rsvp_font,
@@ -1833,20 +2072,24 @@ pub const ReaderCoordinator = struct {
             .chapter_browser => {
                 var rows = [_]ChapterRowView{.{}} ** chapter_browser.visible_rows;
                 const count = self.chapter_browser.displayedCount();
+                var row_count: u8 = 0;
                 for (0..count) |row_index| {
-                    const index = self.chapter_browser.first_visible + @as(u8, @intCast(row_index));
-                    rows[row_index] = .{
-                        .index = index,
-                        .selected = index == self.chapter_browser.selected,
-                        .label = self.publication.chapter_labels[index].slice(),
-                        .path = self.publication.spine[index].slice(),
+                    const browser_index = self.chapter_browser.first_visible + @as(u8, @intCast(row_index));
+                    const spine_index = self.spineIndexForBrowserPosition(browser_index) orelse continue;
+                    rows[row_count] = .{
+                        .index = browser_index,
+                        .selected = browser_index == self.chapter_browser.selected,
+                        .label = self.publication.chapter_labels[spine_index].slice(),
+                        .path = self.publication.spine[spine_index].slice(),
                     };
+                    row_count += 1;
                 }
                 return .{ .chapters = .{
                     .selected = self.chapter_browser.selected,
                     .entries = self.chapter_browser.entry_count,
                     .rows = rows,
-                    .row_count = count,
+                    .row_count = row_count,
+                    .first_visible = self.chapter_browser.first_visible,
                 } };
             },
             else => {},
@@ -1874,6 +2117,26 @@ pub const ReaderCoordinator = struct {
                             if (!self.crank_docked) selected_span = page.wordSpan(selected);
                         };
                     }
+                    var transition: ?PageTransitionView = null;
+                    if (self.page_transition_state.elapsed(self.frame_now_ms)) |elapsed_ms| {
+                        var outgoing_lines = [_][]const u8{""} ** pagination.max_lines;
+                        var outgoing_line_count: u8 = 0;
+                        var source_ready = true;
+                        if (self.page_transition_state.source_page) |source_page| {
+                            if (self.paged.cachedPage(source_page)) |outgoing| {
+                                outgoing_line_count = outgoing.line_count;
+                                for (0..outgoing.line_count) |index| outgoing_lines[index] = outgoing.line(index);
+                            } else source_ready = false;
+                        }
+                        if (source_ready) {
+                            transition = .{
+                                .lines = outgoing_lines,
+                                .line_count = outgoing_line_count,
+                                .direction = self.page_transition_state.direction,
+                                .elapsed_ms = elapsed_ms,
+                            };
+                        } else self.page_transition_state.cancel();
+                    }
                     break :blk .{ .paged = .{
                         .lines = lines,
                         .line_count = line_count,
@@ -1881,6 +2144,7 @@ pub const ReaderCoordinator = struct {
                         .page_index = state.page_index,
                         .waiting = state.waiting_for_page,
                         .reconstructing = state.reconstructing,
+                        .transition = transition,
                         .progress = self.progressView(),
                         .progress_visibility = self.progress_visibility,
                         .progress_position = self.progress_position,
@@ -1905,7 +2169,7 @@ pub const ReaderCoordinator = struct {
                 },
             },
             .unavailable => .{ .failure = .unavailable },
-            .invalid_archive => .{ .failure = .invalid_archive },
+            .invalid_archive => .{ .failure = .{ .invalid_archive = self.opening_failure } },
             .missing_mimetype => .{ .failure = .missing_mimetype },
             .invalid_mimetype => .{ .failure = .invalid_mimetype },
             .chapter_error => .{ .failure = .{ .chapter = .{
@@ -1964,7 +2228,6 @@ fn publicationFingerprint(publication: *const epub.Publication, directory: *cons
         std.mem.writeInt(u16, &path_length, @intCast(path.len), .little);
         hasher.update(&path_length);
         hasher.update(path);
-
         const entry = directory.find(path) catch {
             hasher.update(&.{0});
             continue;
@@ -2004,6 +2267,7 @@ pub fn intentFor(snapshot: InputSnapshot) input.Intent {
         .readiness = switch (snapshot.readiness) {
             .opening => .opening,
             .ready => .ready,
+            .opening_failure => .opening_failure,
             .chapter_error => .chapter_error,
         },
         .mode = switch (snapshot.mode) {
@@ -2077,8 +2341,10 @@ test "Scroll crank conversion keeps its speed while exposing pixel steps" {
 /// to turn them into Playdate graphics calls.
 pub const LibraryView = struct {
     paths: [library_storage.capacity][]const u8,
+    progress: [library_storage.capacity]?u8,
     count: u8,
     selected: u8,
+    first_visible: u8,
 };
 
 pub const ChapterRowView = struct {
@@ -2093,6 +2359,7 @@ pub const ChaptersView = struct {
     entries: u8,
     rows: [chapter_browser.visible_rows]ChapterRowView,
     row_count: u8,
+    first_visible: u8,
 };
 
 pub const PagedView = struct {
@@ -2102,10 +2369,18 @@ pub const PagedView = struct {
     page_index: u32,
     waiting: bool,
     reconstructing: bool,
+    transition: ?PageTransitionView = null,
     progress: ?reading_progress.View = null,
     progress_visibility: ProgressVisibility = .off,
     progress_position: ProgressPosition = .top,
     progress_scope: ProgressScope = .chapter,
+};
+
+pub const PageTransitionView = struct {
+    lines: [pagination.max_lines][]const u8,
+    line_count: u8,
+    direction: page_transition.Direction,
+    elapsed_ms: u16,
 };
 
 /// Scroll tiles borrow the Paged reader's fixed cache for this frame. They
@@ -2156,9 +2431,8 @@ pub const SettingsView = struct {
     selected: SettingsRow,
     first_visible: u4,
     row_count: u4,
-    mode: ReadingMode,
+    total_rows: u4,
     paged_presentation: PagedPresentation,
-    wpm: u16,
     theme: Theme,
     pages_font: ReadingFont,
     rsvp_font: ReadingFont,
@@ -2170,7 +2444,7 @@ pub const SettingsView = struct {
 
 pub const ErrorView = union(enum) {
     unavailable,
-    invalid_archive,
+    invalid_archive: OpeningFailure,
     missing_mimetype,
     invalid_mimetype,
     chapter: ChapterErrorView,
@@ -2195,6 +2469,20 @@ test "coordinator maps platform-free snapshots through existing input priority" 
         .mode = .paged,
         .buttons = .{ .a = true },
     }));
+}
+
+test "library crank selects down clockwise and up counterclockwise" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.library.add("one.epub");
+    coordinator.library.add("two.epub");
+    coordinator.library.add("three.epub");
+
+    coordinator.handleCrank(crank_degrees_per_word, 0);
+    try std.testing.expectEqual(@as(u8, 1), coordinator.library.selected);
+
+    coordinator.handleCrank(-crank_degrees_per_word, 0);
+    try std.testing.expectEqual(@as(u8, 0), coordinator.library.selected);
 }
 
 test "docking hides paged focus without discarding its selected word" {
@@ -2224,6 +2512,42 @@ test "docking hides paged focus without discarding its selected word" {
         .paged => |view| try std.testing.expect(view.selected_span != null),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "cached same-chapter page movement starts a directional transition" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.chapter_index = 0;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.current_page = 1;
+    coordinator.paged.page_index = 1;
+    coordinator.paged.slots[0] = .{ .role = .history, .chapter = 0, .page = 0 };
+    coordinator.paged.slots[1] = .{ .role = .displayed, .chapter = 0, .page = 1 };
+
+    coordinator.updatePageTransition(.{ .chapter = 0, .page = 0 }, false, 100);
+    try std.testing.expect(coordinator.page_transition_state.active);
+    try std.testing.expectEqual(page_transition.Direction.forward, coordinator.page_transition_state.direction);
+    try std.testing.expectEqual(@as(?u32, 0), coordinator.page_transition_state.source_page);
+
+    coordinator.updatePageTransition(.{ .chapter = 0, .page = 1 }, true, 101);
+    try std.testing.expect(!coordinator.page_transition_state.active);
+}
+
+test "completed position restoration transitions from a blank source" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.slots[coordinator.paged.current_page] = .{ .role = .displayed, .chapter = 0, .page = 4 };
+    coordinator.paged.page_index = 4;
+    coordinator.restore_transition_pending = true;
+
+    coordinator.updatePageTransition(null, false, 200);
+    try std.testing.expect(coordinator.page_transition_state.active);
+    try std.testing.expectEqual(@as(?u32, null), coordinator.page_transition_state.source_page);
 }
 
 test "Scroll presentation suppresses Paged selection and preserves its semantic word" {
@@ -2393,6 +2717,10 @@ test "pagination measurement selects the active reading font" {
                 .roobert_11_bold => @as(usize, 40),
                 .roobert_20_medium => @as(usize, 50),
                 .roobert_24_medium => @as(usize, 60),
+                .espy_serif_3 => @as(usize, 70),
+                .espy_serif_4 => @as(usize, 80),
+                .espy_sans_5 => @as(usize, 90),
+                .literata_36pt_medium_30 => @as(usize, 100),
             };
         }
 
@@ -2404,6 +2732,10 @@ test "pagination measurement selects the active reading font" {
                 .roobert_11_bold => 40,
                 .roobert_20_medium => 50,
                 .roobert_24_medium => 60,
+                .espy_serif_3 => 70,
+                .espy_serif_4 => 80,
+                .espy_sans_5 => 90,
+                .literata_36pt_medium_30 => 100,
             };
         }
     };
@@ -2438,7 +2770,7 @@ test "font settings rebuild only active Pages or Scroll layout" {
 
     coordinator.switchPagesFont();
 
-    try std.testing.expectEqual(ReadingFont.roobert_24_medium, coordinator.pages_font);
+    try std.testing.expectEqual(ReadingFont.sasser_slab, coordinator.pages_font);
     try std.testing.expect(!coordinator.paged.current_ready);
     switch (coordinator.chapter_open.?.action) {
         .word_rescan => |word| try std.testing.expectEqual(@as(u32, 17), word),
@@ -2544,17 +2876,58 @@ test "coordinator discovers only EPUB paths through its typed host" {
     try std.testing.expectEqual(@as(u8, 2), coordinator.library.len);
     try std.testing.expectEqualStrings("first.epub", coordinator.library.books[0].slice());
     try std.testing.expectEqualStrings("SECOND.EPUB", coordinator.library.books[1].slice());
+    switch (coordinator.renderModel()) {
+        .library => |view| {
+            try std.testing.expectEqualStrings("first", view.paths[0]);
+            try std.testing.expect(view.progress[0] == null);
+        },
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "coordinator opens the selected book into a fresh opening session" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
+    coordinator.attachAllocator(std.testing.allocator);
+    defer coordinator.cancelOpening();
     coordinator.library.add("book.epub");
     try std.testing.expect(coordinator.openSelectedBook());
     try std.testing.expectEqual(Screen.opening, coordinator.screen);
     try std.testing.expectEqual(Lifecycle.opening, coordinator.lifecycle);
     try std.testing.expect(coordinator.opening_job != null);
     try std.testing.expectEqualStrings("book.epub", coordinator.active_book.slice());
+}
+
+test "opening another book clears stale text and progress statistics" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.attachAllocator(std.testing.allocator);
+    defer coordinator.cancelOpening();
+    coordinator.library.add("new.epub");
+
+    coordinator.paged.current_ready = true;
+    try coordinator.paged.pages[0].appendLineWithMetadata("old book", 0, 2);
+    coordinator.paged.slots[0] = .{ .role = .displayed, .chapter = 0, .page = 0 };
+    coordinator.paged.recordCheckpoint(0, 10, 20);
+    coordinator.rsvp_reader.wpm = 420;
+    coordinator.rsvp_reader.begin(0);
+    _ = try coordinator.rsvp_reader.feed("<p>old</p>");
+    try coordinator.rsvp_reader.finishInput();
+    coordinator.progress_worker.index = try reading_progress.Index.init(.{
+        .book_id = 1,
+        .publication_fingerprint = [_]u8{0xa5} ** 16,
+        .word_semantics_revision = word_semantics_revision,
+        .spine_len = 1,
+    });
+
+    try std.testing.expect(coordinator.openSelectedBook());
+
+    try std.testing.expect(coordinator.paged.current() == null);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.paged.checkpoints.bytes_used);
+    try std.testing.expect(!coordinator.rsvp_reader.hasWord());
+    try std.testing.expectEqual(@as(u16, 420), coordinator.rsvp_reader.wpm);
+    try std.testing.expect(coordinator.progress_worker.snapshot() == null);
+    try std.testing.expectEqual(progress_indexer.Phase.idle, coordinator.progress_worker.status().phase);
 }
 
 const OpeningHostFake = struct {
@@ -2576,6 +2949,7 @@ const OpeningHostFake = struct {
 test "coordinator reports an unavailable book when opening slot acquisition fails" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
+    coordinator.attachAllocator(std.testing.allocator);
     coordinator.library.add("missing.epub");
     _ = coordinator.openSelectedBook();
     var fake = OpeningHostFake{};
@@ -2614,6 +2988,7 @@ const MalformedArchiveHostFake = struct {
 test "coordinator closes the opening slot when archive scanning rejects a book" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
+    coordinator.attachAllocator(std.testing.allocator);
     coordinator.library.add("broken.epub");
     _ = coordinator.openSelectedBook();
     var fake = MalformedArchiveHostFake{};
@@ -2624,6 +2999,7 @@ test "coordinator closes the opening slot when archive scanning rejects a book" 
     coordinator.advanceOpening();
     coordinator.advanceOpening();
     try std.testing.expectEqual(Lifecycle.invalid_archive, coordinator.lifecycle);
+    try std.testing.expectEqual(std.meta.Tag(OpeningFailure).archive_scan, std.meta.activeTag(coordinator.opening_failure));
     try std.testing.expectEqual(@as(u8, 1), fake.close_calls);
     try std.testing.expect(coordinator.opening_job == null);
 }
@@ -2650,6 +3026,8 @@ const EmptyArchiveHostFake = struct {
 test "coordinator validates a scanned archive before exposing its directory index" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
+    coordinator.attachAllocator(std.testing.allocator);
+    defer coordinator.cancelOpening();
     coordinator.library.add("empty.epub");
     _ = coordinator.openSelectedBook();
     var fake = EmptyArchiveHostFake{};
@@ -2661,12 +3039,13 @@ test "coordinator validates a scanned archive before exposing its directory inde
     coordinator.advanceOpening();
     coordinator.advanceOpening();
     try std.testing.expectEqual(opening_session.Phase.find_mimetype, coordinator.opening_job.?.phase);
-    try std.testing.expectEqual(@as(usize, 0), coordinator.archive_index.?.entries.len);
+    try std.testing.expectEqual(@as(u16, 0), coordinator.archive_index.?.archive.entry_count);
 }
 
 test "coordinator reports a missing mimetype after validating an empty archive" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
+    coordinator.attachAllocator(std.testing.allocator);
     coordinator.library.add("empty.epub");
     _ = coordinator.openSelectedBook();
     var fake = EmptyArchiveHostFake{};
@@ -2740,6 +3119,8 @@ const StoredMimetypeHostFake = struct {
 test "coordinator reads and validates the EPUB mimetype before finding its container" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
+    coordinator.attachAllocator(std.testing.allocator);
+    defer coordinator.cancelOpening();
     coordinator.library.add("book.epub");
     _ = coordinator.openSelectedBook();
     var fake = StoredMimetypeHostFake.init();
@@ -2747,7 +3128,7 @@ test "coordinator reads and validates the EPUB mimetype before finding its conta
         .files = .{ .context = &fake, .open = StoredMimetypeHostFake.open, .close = StoredMimetypeHostFake.close, .list_epubs = StoredMimetypeHostFake.list },
         .measure = .{ .context = &fake, .width = StoredMimetypeHostFake.width },
     });
-    for (0..6) |_| coordinator.advanceOpening();
+    for (0..5) |_| coordinator.advanceOpening();
     try std.testing.expectEqual(opening_session.Phase.find_container, coordinator.opening_job.?.phase);
     try std.testing.expect(coordinator.opening_job.?.mimetypeIsValid());
 }
@@ -2755,8 +3136,11 @@ test "coordinator reads and validates the EPUB mimetype before finding its conta
 test "coordinator parses container metadata before package lookup" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
-    coordinator.opening_job = opening_session.Session.start();
-    const job = &coordinator.opening_job.?;
+    coordinator.attachAllocator(std.testing.allocator);
+    defer coordinator.cancelOpening();
+    const job = try std.testing.allocator.create(opening_session.Session);
+    job.* = opening_session.Session.start();
+    coordinator.opening_job = job;
     job.beginMetadataRead(.container);
     try job.appendMetadataBytes("<container><rootfiles><rootfile full-path=\"OPS/book.opf\"/></rootfiles></container>");
     job.finishMetadataRead(.container);
@@ -2771,7 +3155,8 @@ test "coordinator failure releases opening package storage through its allocator
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
     coordinator.attachAllocator(std.testing.allocator);
-    coordinator.opening_job = opening_session.Session.start();
+    coordinator.opening_job = try std.testing.allocator.create(opening_session.Session);
+    coordinator.opening_job.?.* = opening_session.Session.start();
     coordinator.opening_job.?.package_xml = try std.testing.allocator.alloc(u8, 12);
 
     coordinator.failOpening(.invalid_archive);
@@ -2784,7 +3169,8 @@ test "coordinator turns a successful navigation result into a chapter request" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
     coordinator.attachAllocator(std.testing.allocator);
-    coordinator.opening_job = opening_session.Session.start();
+    coordinator.opening_job = try std.testing.allocator.create(opening_session.Session);
+    coordinator.opening_job.?.* = opening_session.Session.start();
     coordinator.opening_job.?.succeed();
 
     coordinator.finishOpening();
@@ -2801,7 +3187,9 @@ test "coordinator completes opening after both optional navigation sources are a
     coordinator.initInPlace(128);
     @memset(std.mem.asBytes(&coordinator.publication), 0);
     coordinator.publication.spine_len = 1;
-    coordinator.opening_job = opening_session.Session.start();
+    coordinator.attachAllocator(std.testing.allocator);
+    coordinator.opening_job = try std.testing.allocator.create(opening_session.Session);
+    coordinator.opening_job.?.* = opening_session.Session.start();
     coordinator.opening_job.?.phase = .find_navigation;
 
     coordinator.advanceOpening();
@@ -2825,6 +3213,7 @@ test "coordinator cancellation clears an unconsumed opening chapter request" {
 test "coordinator rejects a validated archive without its container document" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
+    coordinator.attachAllocator(std.testing.allocator);
     coordinator.library.add("empty.epub");
     _ = coordinator.openSelectedBook();
     var fake = EmptyArchiveHostFake{};
@@ -2853,10 +3242,22 @@ test "render models carry UI data only" {
 test "coordinator owns screen lifecycle without reader or platform state" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
+    try std.testing.expect(coordinator.openSettings());
+    switch (coordinator.renderModel()) {
+        .settings => |view| try std.testing.expectEqual(settings_menu.global_row_count, view.total_rows),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(coordinator.closeSettings());
+    try std.testing.expectEqual(Screen.library, coordinator.screen);
+
     coordinator.beginOpening();
     try std.testing.expectEqual(Screen.opening, coordinator.screen);
     coordinator.beginReading();
     try std.testing.expect(coordinator.openSettings());
+    switch (coordinator.renderModel()) {
+        .settings => |view| try std.testing.expectEqual(settings_menu.row_count, view.total_rows),
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectEqual(Screen.settings, coordinator.screen);
     try std.testing.expect(coordinator.closeSettings());
     try std.testing.expect(coordinator.openChapterBrowser());
@@ -2921,31 +3322,25 @@ test "scrolling settings keeps every selection visible and reset hold uninterrup
     try std.testing.expectEqual(Screen.library, coordinator.screen);
 }
 
-test "statistics is a non-blocking settings child and B returns to its row" {
+test "Down opens reading statistics and B resumes reading" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
     coordinator.beginReading();
-    try std.testing.expect(coordinator.openSettings());
-    for (0..@intFromEnum(SettingsRow.statistics)) |_| coordinator.moveSettingsSelection(1);
-    try std.testing.expectEqual(SettingsRow.statistics, coordinator.settings_menu_state.selected);
-
-    const before = coordinator.progress_worker.status();
-    coordinator.performIntent(.activate_setting, 0);
-    try std.testing.expectEqual(Screen.statistics, coordinator.screen);
-    try std.testing.expect(std.meta.eql(before, coordinator.progress_worker.status()));
-    switch (coordinator.renderModel()) {
-        .statistics => |view| try std.testing.expectEqualStrings("Index: unavailable", view.index.slice()),
-        else => return error.TestUnexpectedResult,
-    }
 
     coordinator.performIntent(intentFor(.{
         .screen = coordinator.screen,
         .readiness = .ready,
         .mode = coordinator.mode,
+        .buttons = .{ .down = true },
+    }), 10);
+    try std.testing.expectEqual(Screen.statistics, coordinator.screen);
+    coordinator.performIntent(intentFor(.{
+        .screen = coordinator.screen,
+        .readiness = .ready,
+        .mode = coordinator.mode,
         .buttons = .{ .b = true },
-    }), 1);
-    try std.testing.expectEqual(Screen.settings, coordinator.screen);
-    try std.testing.expectEqual(SettingsRow.statistics, coordinator.settings_menu_state.selected);
+    }), 11);
+    try std.testing.expectEqual(Screen.reading, coordinator.screen);
 }
 
 test "coordinator retains bounded library and chapter-browser navigation state" {
@@ -2963,6 +3358,45 @@ test "coordinator retains bounded library and chapter-browser navigation state" 
     try std.testing.expect(coordinator.openChapters(3, 1));
     coordinator.chapter_browser.move(1);
     try std.testing.expectEqual(@as(u8, 2), coordinator.chapter_browser.selected);
+}
+
+test "chapter browser omits wrapper and trailing TOC suffix without changing spine indices" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    @memset(std.mem.asBytes(&coordinator.publication), 0);
+    const paths = [_][]const u8{
+        "OEBPS/wrap0000.xhtml",
+        "OEBPS/chapter0001.xhtml",
+        "OEBPS/unlisted-middle.xhtml",
+        "OEBPS/chapter0003.xhtml",
+        "OEBPS/image-wrapper-1.xhtml",
+        "OEBPS/image-wrapper-2.xhtml",
+    };
+    coordinator.publication.spine_len = @intCast(paths.len);
+    for (paths, 0..) |path, index| {
+        coordinator.publication.spine[index].path_len = @intCast(path.len);
+        @memcpy(coordinator.publication.spine[index].path[0..path.len], path);
+    }
+    coordinator.publication.chapter_labels[1].len = 1;
+    coordinator.publication.chapter_labels[3].len = 1;
+    coordinator.chapter_index = 5;
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+
+    coordinator.handleSystemAction(.chapters, 0);
+    try std.testing.expectEqual(@as(u8, 3), coordinator.chapter_browser.entry_count);
+    try std.testing.expectEqual(@as(u8, 2), coordinator.chapter_browser.selected);
+    switch (coordinator.renderModel()) {
+        .chapters => |view| {
+            try std.testing.expectEqualStrings("OEBPS/chapter0001.xhtml", view.rows[0].path);
+            try std.testing.expectEqualStrings("OEBPS/unlisted-middle.xhtml", view.rows[1].path);
+            try std.testing.expectEqualStrings("OEBPS/chapter0003.xhtml", view.rows[2].path);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    coordinator.performIntent(.open_browser_chapter, 0);
+    try std.testing.expectEqual(@as(u8, 3), coordinator.chapter_open.?.index);
 }
 
 const ChapterSlotHostFake = struct {
@@ -3081,14 +3515,12 @@ test "coordinator idles indexing for foreground work and shares verified progres
     var scan_buffer: [64]u8 = undefined;
     var filename_buffer: [64]u8 = undefined;
     const archive = try zip.Archive.open(fake.reader(), &scan_buffer);
-    var indexed_entries: [1]zip.IndexedEntry = undefined;
-    indexed_entries[0].name_len = StoredChapterHostFake.name.len;
-    @memcpy(indexed_entries[0].name[0..StoredChapterHostFake.name.len], StoredChapterHostFake.name);
-    indexed_entries[0].entry = try archive.find(StoredChapterHostFake.name, &filename_buffer);
-    coordinator.archive_index = .{ .archive = archive, .entries = &indexed_entries };
+    var entries = [_]zip.IndexedEntry{zip.indexedEntry(StoredChapterHostFake.name, try archive.find(StoredChapterHostFake.name, &filename_buffer))};
+    const directory = zip.DirectoryIndex{ .archive = archive, .entries = &entries };
     coordinator.screen = .reading;
     coordinator.lifecycle = .ready;
-    coordinator.startProgressIndexing();
+    coordinator.startProgressIndexing(publicationFingerprint(&coordinator.publication, &directory));
+    coordinator.chapter_open = .{ .index = 0, .action = .normal };
 
     const before = coordinator.progress_worker.status();
     coordinator.stepProgressIndex(true);

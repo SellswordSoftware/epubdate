@@ -6,7 +6,7 @@ const max_rsvp_wpm: u16 = 1000;
 const rsvp_wpm_step: u16 = 25;
 
 /// Global reader preferences are deliberately separate from the per-book
-/// resume record. The version-eight encoding remains fixed at eight bytes.
+/// resume record. The version-nine encoding remains fixed at eight bytes.
 pub const encoded_size = 8;
 
 pub const ReadingMode = enum(u8) { paged = 0, rsvp = 1 };
@@ -19,9 +19,14 @@ pub const ReadingFont = enum(u8) {
     roobert_11_bold = 3,
     roobert_20_medium = 4,
     roobert_24_medium = 5,
+    espy_serif_3 = 6,
+    espy_serif_4 = 7,
+    espy_sans_5 = 8,
+    literata_36pt_medium_30 = 9,
 };
 
-pub const default_reading_font: ReadingFont = .roobert_20_medium;
+pub const default_pages_font: ReadingFont = .newsleak_serif;
+pub const default_rsvp_font: ReadingFont = .roobert_20_medium;
 
 const LegacyFont = enum(u8) {
     roobert = 0,
@@ -39,8 +44,8 @@ pub const Settings = struct {
     reading_mode: ReadingMode = .paged,
     rsvp_wpm: u16 = default_rsvp_wpm,
     theme: Theme = .light,
-    pages_font: ReadingFont = default_reading_font,
-    rsvp_font: ReadingFont = default_reading_font,
+    pages_font: ReadingFont = default_pages_font,
+    rsvp_font: ReadingFont = default_rsvp_font,
     progress_visibility: ProgressVisibility = .off,
     progress_position: ProgressPosition = .top,
     progress_scope: ProgressScope = .chapter,
@@ -50,17 +55,21 @@ pub const Settings = struct {
 pub const Error = error{InvalidRecord};
 
 pub fn encode(settings: Settings, output: *[encoded_size]u8) void {
-    // Byte four: mode bit, Pages/Scroll three-bit font, RSVP three-bit font.
+    const pages_font = @intFromEnum(settings.pages_font);
+    const rsvp_font = @intFromEnum(settings.rsvp_font);
+    // Byte four: mode bit, each font's low three bits, then Pages bit four.
     const mode_and_fonts: u8 = @intFromEnum(settings.reading_mode) |
-        (@intFromEnum(settings.pages_font) << 1) |
-        (@intFromEnum(settings.rsvp_font) << 4);
-    // Byte seven: display options plus two reserved high bits.
+        ((pages_font & 0x7) << 1) |
+        ((rsvp_font & 0x7) << 4) |
+        ((pages_font & 0x8) << 4);
+    // Byte seven: display options, RSVP bit four, and one reserved high bit.
     const display: u8 = @intFromEnum(settings.theme) |
         (@intFromEnum(settings.progress_visibility) << 1) |
         (@intFromEnum(settings.progress_position) << 2) |
         (@intFromEnum(settings.progress_scope) << 3) |
-        (@intFromEnum(settings.paged_presentation) << 5);
-    output.* = .{ 'E', 'P', 'S', 8, mode_and_fonts, 0, 0, display };
+        (@intFromEnum(settings.paged_presentation) << 5) |
+        ((rsvp_font & 0x8) << 3);
+    output.* = .{ 'E', 'P', 'S', 9, mode_and_fonts, 0, 0, display };
     std.mem.writeInt(u16, output[5..7], clampWpm(settings.rsvp_wpm), .little);
 }
 
@@ -84,6 +93,7 @@ pub fn decode(input: *const [encoded_size]u8) Error!Settings {
         6 => decodeVersionSix(input),
         7 => decodeVersionSeven(input),
         8 => decodeVersionEight(input),
+        9 => decodeVersionNine(input),
         else => error.InvalidRecord,
     };
 }
@@ -95,14 +105,39 @@ pub fn nextReadingMode(mode: ReadingMode) ReadingMode {
     };
 }
 
-pub fn nextReadingFont(font: ReadingFont) ReadingFont {
+pub fn nextPagesFont(font: ReadingFont) ReadingFont {
     return switch (font) {
         .newsleak_serif => .sasser_slab,
         .sasser_slab => .asheville_sans_14_bold,
         .asheville_sans_14_bold => .roobert_11_bold,
-        .roobert_11_bold => .roobert_20_medium,
+        .roobert_11_bold => .espy_serif_3,
+        .espy_serif_3 => .espy_serif_4,
+        .espy_serif_4 => .espy_sans_5,
+        .espy_sans_5 => .newsleak_serif,
+        .roobert_20_medium, .roobert_24_medium, .literata_36pt_medium_30 => default_pages_font,
+    };
+}
+
+pub fn nextRsvpFont(font: ReadingFont) ReadingFont {
+    return switch (font) {
         .roobert_20_medium => .roobert_24_medium,
-        .roobert_24_medium => .newsleak_serif,
+        .roobert_24_medium => .literata_36pt_medium_30,
+        .literata_36pt_medium_30 => .roobert_20_medium,
+        .newsleak_serif, .sasser_slab, .asheville_sans_14_bold, .roobert_11_bold, .espy_serif_3, .espy_serif_4, .espy_sans_5 => default_rsvp_font,
+    };
+}
+
+pub fn normalizePagesFont(font: ReadingFont) ReadingFont {
+    return switch (font) {
+        .newsleak_serif, .sasser_slab, .asheville_sans_14_bold, .roobert_11_bold, .espy_serif_3, .espy_serif_4, .espy_sans_5 => font,
+        .roobert_20_medium, .roobert_24_medium, .literata_36pt_medium_30 => default_pages_font,
+    };
+}
+
+pub fn normalizeRsvpFont(font: ReadingFont) ReadingFont {
+    return switch (font) {
+        .roobert_20_medium, .roobert_24_medium, .literata_36pt_medium_30 => font,
+        .newsleak_serif, .sasser_slab, .asheville_sans_14_bold, .roobert_11_bold, .espy_serif_3, .espy_serif_4, .espy_sans_5 => default_rsvp_font,
     };
 }
 
@@ -154,8 +189,23 @@ fn decodeVersionEight(input: *const [encoded_size]u8) Error!Settings {
         .reading_mode = if (input[4] & 0x1 == 0) .paged else .rsvp,
         .rsvp_wpm = try storedWpm(input),
         .theme = if (input[7] & 0x1 == 0) .light else .dark,
-        .pages_font = try readingFontFromBits((input[4] >> 1) & 0x7),
-        .rsvp_font = try readingFontFromBits((input[4] >> 4) & 0x7),
+        .pages_font = try versionEightReadingFontFromBits((input[4] >> 1) & 0x7),
+        .rsvp_font = try versionEightReadingFontFromBits((input[4] >> 4) & 0x7),
+        .progress_visibility = if ((input[7] >> 1) & 0x1 == 0) .off else .on,
+        .progress_position = if ((input[7] >> 2) & 0x1 == 0) .top else .bottom,
+        .progress_scope = try scopeFromBits((input[7] >> 3) & 0x3),
+        .paged_presentation = if ((input[7] >> 5) & 0x1 == 0) .pages else .scroll,
+    };
+}
+
+fn decodeVersionNine(input: *const [encoded_size]u8) Error!Settings {
+    if (input[7] & 0x80 != 0) return error.InvalidRecord;
+    return .{
+        .reading_mode = if (input[4] & 0x1 == 0) .paged else .rsvp,
+        .rsvp_wpm = try storedWpm(input),
+        .theme = if (input[7] & 0x1 == 0) .light else .dark,
+        .pages_font = try readingFontFromBits(((input[4] >> 1) & 0x7) | ((input[4] >> 4) & 0x8)),
+        .rsvp_font = try readingFontFromBits(((input[4] >> 4) & 0x7) | ((input[7] >> 3) & 0x8)),
         .progress_visibility = if ((input[7] >> 1) & 0x1 == 0) .off else .on,
         .progress_position = if ((input[7] >> 2) & 0x1 == 0) .top else .bottom,
         .progress_scope = try scopeFromBits((input[7] >> 3) & 0x3),
@@ -210,8 +260,17 @@ fn readingFontFromBits(value: u8) Error!ReadingFont {
         @intFromEnum(ReadingFont.roobert_11_bold) => .roobert_11_bold,
         @intFromEnum(ReadingFont.roobert_20_medium) => .roobert_20_medium,
         @intFromEnum(ReadingFont.roobert_24_medium) => .roobert_24_medium,
+        @intFromEnum(ReadingFont.espy_serif_3) => .espy_serif_3,
+        @intFromEnum(ReadingFont.espy_serif_4) => .espy_serif_4,
+        @intFromEnum(ReadingFont.espy_sans_5) => .espy_sans_5,
+        @intFromEnum(ReadingFont.literata_36pt_medium_30) => .literata_36pt_medium_30,
         else => error.InvalidRecord,
     };
+}
+
+fn versionEightReadingFontFromBits(value: u8) Error!ReadingFont {
+    if (value > @intFromEnum(ReadingFont.roobert_24_medium)) return error.InvalidRecord;
+    return readingFontFromBits(value);
 }
 
 fn scopeFromBits(value: u8) Error!ProgressScope {
@@ -227,8 +286,8 @@ fn storedWpm(input: *const [encoded_size]u8) Error!u16 {
     return validateWpm(std.mem.readInt(u16, input[5..7], .little)) orelse error.InvalidRecord;
 }
 
-test "version eight round trips every Pages and RSVP font pair" {
-    const fonts = [_]ReadingFont{ .newsleak_serif, .sasser_slab, .asheville_sans_14_bold, .roobert_11_bold, .roobert_20_medium, .roobert_24_medium };
+test "version nine round trips every Pages and RSVP font pair" {
+    const fonts = [_]ReadingFont{ .newsleak_serif, .sasser_slab, .asheville_sans_14_bold, .roobert_11_bold, .roobert_20_medium, .roobert_24_medium, .espy_serif_3, .espy_serif_4, .espy_sans_5, .literata_36pt_medium_30 };
     for (fonts) |pages_font| for (fonts) |rsvp_font| {
         var bytes: [encoded_size]u8 = undefined;
         encode(.{
@@ -275,9 +334,18 @@ test "version eight rejects reserved and unsupported font bits" {
     try std.testing.expectError(error.InvalidRecord, decode(&bytes));
 }
 
-test "cycles through the six reading fonts" {
-    try std.testing.expectEqual(ReadingFont.sasser_slab, nextReadingFont(.newsleak_serif));
-    try std.testing.expectEqual(ReadingFont.newsleak_serif, nextReadingFont(.roobert_24_medium));
+test "Pages and RSVP cycle through separate font sets" {
+    try std.testing.expectEqual(ReadingFont.sasser_slab, nextPagesFont(.newsleak_serif));
+    try std.testing.expectEqual(ReadingFont.newsleak_serif, nextPagesFont(.espy_sans_5));
+    try std.testing.expectEqual(ReadingFont.newsleak_serif, nextPagesFont(.literata_36pt_medium_30));
+
+    try std.testing.expectEqual(ReadingFont.roobert_24_medium, nextRsvpFont(.roobert_20_medium));
+    try std.testing.expectEqual(ReadingFont.literata_36pt_medium_30, nextRsvpFont(.roobert_24_medium));
+    try std.testing.expectEqual(ReadingFont.roobert_20_medium, nextRsvpFont(.literata_36pt_medium_30));
+    try std.testing.expectEqual(ReadingFont.roobert_20_medium, nextRsvpFont(.espy_sans_5));
+
+    try std.testing.expectEqual(ReadingFont.newsleak_serif, normalizePagesFont(.roobert_24_medium));
+    try std.testing.expectEqual(ReadingFont.roobert_20_medium, normalizeRsvpFont(.espy_serif_4));
 }
 
 test "cycles between the currently supported reading modes" {

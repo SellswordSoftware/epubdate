@@ -15,6 +15,7 @@ pub const PlaydateFileReader = struct {
     file_api: *const pdapi.PlaydateFile,
     file: *pdapi.SDFile,
     size: u32,
+    current_offset: u32,
 
     pub fn open(file_api: *const pdapi.PlaydateFile, path: [*:0]const u8) Error!PlaydateFileReader {
         const file = file_api.open(path, pdapi.FILE_READ | pdapi.FILE_READ_DATA) orelse return error.OpenFailed;
@@ -29,6 +30,7 @@ pub const PlaydateFileReader = struct {
             .file_api = file_api,
             .file = file,
             .size = @intCast(end),
+            .current_offset = 0,
         };
     }
 
@@ -46,9 +48,11 @@ pub const PlaydateFileReader = struct {
 
     fn readAt(context: *anyopaque, offset: u32, destination: []u8) zip.Error!void {
         const self: *PlaydateFileReader = @ptrCast(@alignCast(context));
-        const file_offset: c_int = @intCast(offset);
-        if (self.file_api.seek(self.file, file_offset, pdapi.SEEK_SET) != 0) return error.ReadFailed;
+        if (offset != self.current_offset) {
+            if (self.file_api.seek(self.file, @intCast(offset), pdapi.SEEK_SET) != 0) return error.ReadFailed;
+        }
         const bytes_read = self.file_api.read(self.file, destination.ptr, @intCast(destination.len));
         if (bytes_read < 0 or @as(usize, @intCast(bytes_read)) != destination.len) return error.UnexpectedEof;
+        self.current_offset = offset + @as(u32, @intCast(destination.len));
     }
 };

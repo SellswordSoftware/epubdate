@@ -130,10 +130,15 @@ pub const Archive = struct {
 /// Resumable EOCD scan. Each `step` reads and searches at most one caller-
 /// supplied chunk, allowing UI callers to budget archive opening per frame.
 pub const ArchiveScanner = struct {
+    pub const ReadBoundary = struct { nonzero: u32, zero: u32 };
+
     reader: Reader,
     earliest_offset: u32,
     scan_end: u32,
     finished: bool = false,
+    tail_checked: bool = false,
+    tail_signature: [4]u8 = [_]u8{0} ** 4,
+    read_boundary: ?ReadBoundary = null,
 
     pub fn init(reader: Reader) Error!ArchiveScanner {
         if (reader.size < 22) return error.FileTooSmall;
@@ -149,6 +154,23 @@ pub const ArchiveScanner = struct {
     pub fn step(self: *ArchiveScanner, scan_buffer: []u8) Error!?Archive {
         if (scan_buffer.len < 4) return error.FileTooSmall;
         if (self.finished) return error.EndOfCentralDirectoryNotFound;
+
+        // Most ZIPs have no comment, so their EOCD is the final 22 bytes.
+        // Probe that exact record before using larger backward scan reads.
+        // Besides being cheaper, this avoids device filesystem edge cases on
+        // large, unaligned reads near the end of a file.
+        if (!self.tail_checked) {
+            self.tail_checked = true;
+            const candidate_offset = self.reader.size - 22;
+            var header: [22]u8 = undefined;
+            try self.reader.readAt(candidate_offset, &header);
+            self.tail_signature = header[0..4].*;
+            if (readU32(header[0..4]) == end_of_central_directory_signature and readU16(header[20..22]) == 0) {
+                self.finished = true;
+                return try parseEndOfCentralDirectory(self.reader, header, candidate_offset);
+            }
+        }
+        if (self.read_boundary != null) return self.stepReadBoundaryDiagnostic(scan_buffer);
 
         const chunk_start = @max(self.earliest_offset, self.scan_end - @min(self.scan_end - self.earliest_offset, @as(u32, @intCast(scan_buffer.len))));
         const chunk_len: usize = self.scan_end - chunk_start;
@@ -171,12 +193,39 @@ pub const ArchiveScanner = struct {
             index -= 1;
         }
         if (chunk_start == self.earliest_offset) {
+            if (std.mem.allEqual(u8, &self.tail_signature, 0) and self.reader.size > @as(u32, @intCast(scan_buffer.len * 2))) {
+                return self.stepReadBoundaryDiagnostic(scan_buffer);
+            }
             self.finished = true;
             return error.EndOfCentralDirectoryNotFound;
         }
         // Retain three bytes of overlap so an EOCD signature straddling two
         // chunks is still discovered on the next step.
         self.scan_end = chunk_start + 3;
+        return null;
+    }
+
+    /// Narrows a device read boundary one bounded probe per opening frame.
+    /// This is diagnostic only: an all-zero block is not proof of EOF, so the
+    /// caller reports the resulting bracket rather than treating it as data.
+    fn stepReadBoundaryDiagnostic(self: *ArchiveScanner, buffer: []u8) Error!?Archive {
+        const probe_len: u32 = @intCast(buffer.len);
+        if (self.read_boundary == null) {
+            self.read_boundary = .{ .nonzero = 0, .zero = self.reader.size - probe_len };
+            return null;
+        }
+        const boundary = &self.read_boundary.?;
+        if (boundary.zero - boundary.nonzero <= probe_len) {
+            self.finished = true;
+            return error.EndOfCentralDirectoryNotFound;
+        }
+        const probe_offset = boundary.nonzero + (boundary.zero - boundary.nonzero) / 2;
+        try self.reader.readAt(probe_offset, buffer);
+        if (std.mem.allEqual(u8, buffer, 0)) {
+            boundary.zero = probe_offset;
+        } else {
+            boundary.nonzero = probe_offset;
+        }
         return null;
     }
 };
@@ -227,30 +276,38 @@ pub const EntryFinder = struct {
 /// the application apply its explicit entry-count policy.
 pub const MemberRange = struct { start: u32, end: u32 };
 
-/// A caller-owned, bounded directory index. Names and entry metadata are
-/// copied only after the complete central directory has been validated, so
-/// later reader jobs never need to trust a fresh central-directory scan.
+/// Compact member metadata retained after validation. A cryptographic name
+/// digest avoids reserving 256 bytes per filename for image-heavy EPUBs.
 pub const IndexedEntry = struct {
-    name: [limits.max_archive_filename_bytes]u8 = undefined,
-    name_len: u16 = 0,
-    entry: Entry = undefined,
-
-    pub fn nameSlice(self: *const IndexedEntry) []const u8 {
-        return self.name[0..self.name_len];
-    }
+    name_hash: [16]u8,
+    entry: Entry,
 };
 
+pub fn indexedEntry(name: []const u8, entry: Entry) IndexedEntry {
+    return .{ .name_hash = nameHash(name), .entry = entry };
+}
+
+/// A caller-owned, bounded directory index. Names are represented by a
+/// 128-bit digest, keeping lookup and progress fingerprints stable without
+/// retaining full member paths.
 pub const DirectoryIndex = struct {
     archive: Archive,
     entries: []const IndexedEntry,
 
     pub fn find(self: *const DirectoryIndex, name: []const u8) Error!Entry {
-        for (self.entries) |*indexed| {
-            if (std.mem.eql(u8, name, indexed.nameSlice())) return indexed.entry;
+        const wanted = nameHash(name);
+        for (self.entries) |indexed| {
+            if (std.mem.eql(u8, &wanted, &indexed.name_hash)) return indexed.entry;
         }
         return error.EntryNotFound;
     }
 };
+
+fn nameHash(name: []const u8) [16]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(name, &digest, .{});
+    return digest[0..16].*;
+}
 
 /// Incrementally validates every central-directory record before an EPUB
 /// caller resolves entries. One step reads at most one filename/header pair.
@@ -308,10 +365,7 @@ pub const DirectoryValidator = struct {
         }
         self.ranges[self.entry_index] = .{ .start = start, .end = end };
         if (self.indexed_entries) |indexed_entries| {
-            const indexed = &indexed_entries[self.entry_index];
-            @memcpy(indexed.name[0..filename_length], filename_buffer[0..filename_length]);
-            indexed.name_len = filename_length;
-            indexed.entry = entry;
+            indexed_entries[self.entry_index] = indexedEntry(filename_buffer[0..filename_length], entry);
         }
         self.cursor += record_size;
         self.entry_index += 1;
@@ -569,7 +623,7 @@ test "directory validator accepts a complete ordinary archive" {
     try std.testing.expect(try validator.step(&filename_buffer));
 }
 
-test "validated directory index resolves entries without another directory scan" {
+test "validated directory index resolves entries through compact hashes" {
     var archive_bytes: [194]u8 = undefined;
     const archive_len = makeTwoStoredEntriesArchive(&archive_bytes);
     var source = MemoryReader{ .bytes = archive_bytes[0..archive_len] };
@@ -603,8 +657,11 @@ test "directory validator rejects traversal member names before lookup" {
 }
 
 test "scans the end record incrementally" {
-    var archive_bytes: [134]u8 = undefined;
-    const archive_len = makeStoredMimetypeArchive(&archive_bytes);
+    var archive_bytes: [138]u8 = undefined;
+    const end_record_len = makeStoredMimetypeArchive(&archive_bytes);
+    writeU16(&archive_bytes, end_record_len - 2, 4);
+    @memcpy(archive_bytes[end_record_len .. end_record_len + 4], "note");
+    const archive_len = end_record_len + 4;
     var source = MemoryReader{ .bytes = archive_bytes[0..archive_len] };
     var scan_buffer: [4]u8 = undefined;
     var scanner = try ArchiveScanner.init(source.reader());
@@ -616,6 +673,36 @@ test "scans the end record incrementally" {
     }
     try std.testing.expect(steps > 1);
     try std.testing.expectEqual(@as(u16, 1), archive.?.entry_count);
+}
+
+test "zero-tail scan failure narrows the readable offset boundary" {
+    const ZeroBoundaryReader = struct {
+        const size = 4 * 1024 * 1024;
+        const boundary = 2 * 1024 * 1024;
+
+        fn readAt(_: *anyopaque, offset: u32, destination: []u8) Error!void {
+            @memset(destination, if (offset < boundary) 0x7f else 0);
+        }
+    };
+    var context: u8 = 0;
+    const reader = Reader{
+        .context = &context,
+        .size = ZeroBoundaryReader.size,
+        .read_at = ZeroBoundaryReader.readAt,
+    };
+    var scan_buffer: [1024]u8 = undefined;
+    var scanner = try ArchiveScanner.init(reader);
+    while (true) {
+        const result = scanner.step(&scan_buffer) catch |err| {
+            try std.testing.expectEqual(error.EndOfCentralDirectoryNotFound, err);
+            break;
+        };
+        try std.testing.expect(result == null);
+    }
+    const boundary = scanner.read_boundary.?;
+    try std.testing.expect(boundary.nonzero < ZeroBoundaryReader.boundary);
+    try std.testing.expect(boundary.zero >= ZeroBoundaryReader.boundary);
+    try std.testing.expect(boundary.zero - boundary.nonzero <= scan_buffer.len);
 }
 
 test "finds the stored mimetype entry by archive name" {

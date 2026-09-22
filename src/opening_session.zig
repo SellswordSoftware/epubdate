@@ -80,8 +80,8 @@ pub const Session = struct {
     validator: ?zip.DirectoryValidator = null,
     scan_buffer: [1024]u8 = undefined,
     filename_buffer: [limits.max_archive_filename_bytes]u8 = undefined,
-    member_ranges: [epub.max_manifest_items]zip.MemberRange = undefined,
-    indexed_entries: [epub.max_manifest_items]zip.IndexedEntry = undefined,
+    member_ranges: [limits.max_archive_entries]zip.MemberRange = undefined,
+    indexed_entries: [limits.max_archive_entries]zip.IndexedEntry = undefined,
     finder: ?zip.EntryFinder = null,
     stream: ?zip.EntryStream = null,
     target: MetadataTarget = .mimetype,
@@ -95,7 +95,7 @@ pub const Session = struct {
     package_path_len: usize = 0,
     navigation_parser: ?NavigationParser = null,
     package_xml: ?[]u8 = null,
-    opf_workspace: ?*epub.OpfWorkspace = null,
+    opf_workspace: epub.OpfWorkspace = undefined,
     result: ?Result = null,
 
     /// Creates a new session ready for its first bounded opening step.
@@ -141,21 +141,20 @@ pub const Session = struct {
         return archive;
     }
 
-    /// Validates one central-directory record. The caller may retain a copy
-    /// of the resulting index after this returns true.
+    /// Validates one central-directory record. The completed index remains
+    /// valid until this session is destroyed.
     pub fn stepDirectoryValidation(self: *Session) zip.Error!bool {
         if (!try self.validator.?.step(&self.filename_buffer)) return false;
         self.phase = .find_mimetype;
         return true;
     }
 
-    /// Copies the validated directory metadata into storage that outlives the
-    /// opening session, for chapter streaming after the opening job ends.
-    pub fn copyDirectoryIndex(self: *const Session, destination: []zip.IndexedEntry) error{DirectoryStorageTooSmall}!zip.DirectoryIndex {
-        const archive = self.archive orelse return error.DirectoryStorageTooSmall;
-        if (destination.len < archive.entry_count) return error.DirectoryStorageTooSmall;
-        @memcpy(destination[0..archive.entry_count], self.indexed_entries[0..archive.entry_count]);
-        return .{ .archive = archive, .entries = destination[0..archive.entry_count] };
+    /// Borrows the compact validated directory metadata while the opening
+    /// session is alive. It is used only to finish metadata lookup and derive
+    /// the durable publication fingerprint.
+    pub fn directoryIndex(self: *const Session) error{DirectoryUnavailable}!zip.DirectoryIndex {
+        const archive = self.archive orelse return error.DirectoryUnavailable;
+        return .{ .archive = archive, .entries = self.indexed_entries[0..archive.entry_count] };
     }
 
     pub fn mimetypeIsValid(self: *const Session) bool {
@@ -197,9 +196,7 @@ pub const Session = struct {
     /// on the same cleanup path.
     pub fn cancel(self: *Session, allocator: std.mem.Allocator) void {
         if (self.package_xml) |buffer| allocator.free(buffer);
-        if (self.opf_workspace) |workspace| allocator.destroy(workspace);
         self.package_xml = null;
-        self.opf_workspace = null;
         self.stream = null;
         self.navigation_parser = null;
         self.closeFileLease();
@@ -255,9 +252,7 @@ pub const Session = struct {
     /// Discards the temporary OPF inputs once their data has been committed to
     /// the publication and enters navigation discovery.
     pub fn finishPackageParsing(self: *Session, allocator: std.mem.Allocator) void {
-        if (self.opf_workspace) |workspace| allocator.destroy(workspace);
         if (self.package_xml) |buffer| allocator.free(buffer);
-        self.opf_workspace = null;
         self.package_xml = null;
         self.phase = .find_navigation;
     }
@@ -284,11 +279,9 @@ test "a started opening session has no result before file or archive work" {
 test "cancelling an opening session releases temporary allocations exactly once" {
     var session = Session.start();
     session.package_xml = try std.testing.allocator.alloc(u8, 12);
-    session.opf_workspace = try std.testing.allocator.create(epub.OpfWorkspace);
 
     session.cancel(std.testing.allocator);
     try std.testing.expect(session.package_xml == null);
-    try std.testing.expect(session.opf_workspace == null);
     session.cancel(std.testing.allocator);
 }
 
@@ -411,7 +404,7 @@ test "metadata buffers and container path stay within the opening session" {
     try std.testing.expectEqual(Phase.find_package, session.phase);
 }
 
-test "validated directory entries are copied out for later chapter reading" {
+test "validated directory entries are exposed in compact form" {
     const NoopReader = struct {
         fn readAt(_: *anyopaque, _: u32, _: []u8) zip.Error!void {}
     };
@@ -423,33 +416,26 @@ test "validated directory entries are copied out for later chapter reading" {
         .central_directory_size = 0,
         .entry_count = 1,
     };
-    @memcpy(session.indexed_entries[0].name[0..9], "one.xhtml");
-    session.indexed_entries[0].name_len = 9;
-    session.indexed_entries[0].entry = .{
+    session.indexed_entries[0] = zip.indexedEntry("one.xhtml", .{
         .flags = 0,
         .compression = .stored,
         .crc32 = 0,
         .compressed_size = 0,
         .uncompressed_size = 0,
         .local_header_offset = 0,
-    };
-
-    var destination: [epub.max_manifest_items]zip.IndexedEntry = undefined;
-    const index = try session.copyDirectoryIndex(&destination);
-
+    });
+    const index = try session.directoryIndex();
+    try std.testing.expectEqual(@as(u16, 1), index.archive.entry_count);
     try std.testing.expectEqual(@as(usize, 1), index.entries.len);
-    try std.testing.expectEqualStrings("one.xhtml", index.entries[0].nameSlice());
 }
 
 test "successful package parsing releases temporary ownership before navigation" {
     var session = Session.start();
     session.package_xml = try std.testing.allocator.alloc(u8, 12);
-    session.opf_workspace = try std.testing.allocator.create(epub.OpfWorkspace);
 
     session.finishPackageParsing(std.testing.allocator);
 
     try std.testing.expect(session.package_xml == null);
-    try std.testing.expect(session.opf_workspace == null);
     try std.testing.expectEqual(Phase.find_navigation, session.phase);
 }
 

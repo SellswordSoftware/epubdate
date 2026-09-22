@@ -1,11 +1,18 @@
 const std = @import("std");
 
-pub const max_chapters: usize = 64;
-pub const encoded_size: usize = 304;
+pub const max_chapters: usize = 128;
+pub const encoded_size: usize = 576;
+pub const legacy_encoded_size: usize = 304;
 
-const counts_offset: usize = 44;
+const mask_word_count = max_chapters / 32;
+const counts_offset: usize = 60;
 const checksum_offset: usize = encoded_size - @sizeOf(u32);
 const encoded_size_units: u8 = encoded_size / 16;
+const legacy_max_chapters: usize = 64;
+const legacy_mask_word_count = legacy_max_chapters / 32;
+const legacy_counts_offset: usize = 44;
+const legacy_checksum_offset: usize = legacy_encoded_size - @sizeOf(u32);
+const legacy_encoded_size_units: u8 = legacy_encoded_size / 16;
 
 pub const Error = error{
     InvalidRecord,
@@ -22,7 +29,7 @@ pub const Key = struct {
 };
 
 pub const Mask = struct {
-    words: [2]u32 = .{ 0, 0 },
+    words: [mask_word_count]u32 = [_]u32{0} ** mask_word_count,
 
     pub fn contains(self: Mask, chapter: u8) bool {
         if (chapter >= max_chapters) return false;
@@ -44,7 +51,10 @@ pub const Mask = struct {
     }
 
     fn intersects(self: Mask, other: Mask) bool {
-        return self.words[0] & other.words[0] != 0 or self.words[1] & other.words[1] != 0;
+        for (self.words, other.words) |left, right| {
+            if (left & right != 0) return true;
+        }
+        return false;
     }
 
     fn hasBitsOutside(self: Mask, spine_len: u8) bool {
@@ -86,6 +96,10 @@ pub const WideCount = struct {
 
     pub fn lessThan(self: WideCount, other: WideCount) bool {
         return self.hi < other.hi or (self.hi == other.hi and self.lo < other.lo);
+    }
+
+    pub fn toU64(self: WideCount) u64 {
+        return (@as(u64, self.hi) << 32) | self.lo;
     }
 };
 
@@ -140,7 +154,7 @@ pub const Index = struct {
         try self.validateChapter(cursor.chapter);
         const chapter_metric = try self.chapterMetric(cursor);
 
-        if (self.failed.words[0] != 0 or self.failed.words[1] != 0) {
+        if (!std.mem.allEqual(u32, &self.failed.words, 0)) {
             return .{ .chapter = chapter_metric, .book = .unavailable };
         }
         for (0..self.key.spine_len) |chapter| {
@@ -170,6 +184,19 @@ pub const Index = struct {
         };
     }
 
+    /// Returns a whole-book percentage only once every chapter count is
+    /// verified. A missing value deliberately avoids presenting an estimate.
+    pub fn bookPercent(self: *const Index, cursor: Cursor) ?u8 {
+        const book = (self.view(cursor) catch return null).book;
+        const fraction = switch (book) {
+            .exact => |value| value,
+            .pending, .unavailable => return null,
+        };
+        const total = fraction.total.toU64();
+        if (total == 0) return null;
+        return @intCast((fraction.reached.toU64() * 100) / total);
+    }
+
     fn chapterMetric(self: *const Index, cursor: Cursor) Error!Metric {
         if (self.failed.contains(cursor.chapter)) return .unavailable;
         if (!self.exact.contains(cursor.chapter)) return .pending;
@@ -190,16 +217,14 @@ pub const Index = struct {
 pub fn encode(index: Index, output: *[encoded_size]u8) Error!void {
     try validateIndex(index);
     @memset(output, 0);
-    @memcpy(output[0..4], "EPI\x01");
+    @memcpy(output[0..4], "EPI\x02");
     std.mem.writeInt(u32, output[4..8], index.key.book_id, .little);
     @memcpy(output[8..24], &index.key.publication_fingerprint);
     std.mem.writeInt(u16, output[24..26], index.key.word_semantics_revision, .little);
     output[26] = index.key.spine_len;
     output[27] = encoded_size_units;
-    std.mem.writeInt(u32, output[28..32], index.exact.words[0], .little);
-    std.mem.writeInt(u32, output[32..36], index.exact.words[1], .little);
-    std.mem.writeInt(u32, output[36..40], index.failed.words[0], .little);
-    std.mem.writeInt(u32, output[40..44], index.failed.words[1], .little);
+    for (index.exact.words, 0..) |word, word_index| writeU32(output, 28 + word_index * @sizeOf(u32), word);
+    for (index.failed.words, 0..) |word, word_index| writeU32(output, 44 + word_index * @sizeOf(u32), word);
     for (index.chapter_words, 0..) |count, chapter| {
         const offset = counts_offset + chapter * @sizeOf(u32);
         writeU32(output, offset, count);
@@ -209,9 +234,58 @@ pub fn encode(index: Index, output: *[encoded_size]u8) Error!void {
 
 pub fn decode(input: *const [encoded_size]u8, expected: Key) Error!Index {
     try validateKey(expected);
-    if (!std.mem.eql(u8, input[0..4], "EPI\x01")) return error.InvalidRecord;
-    if (input[27] != encoded_size_units) return error.InvalidRecord;
-    if (std.mem.readInt(u32, input[checksum_offset..encoded_size], .little) != checksum(input[0..checksum_offset])) return error.InvalidRecord;
+    const index = try decodeStored(input);
+    if (!std.meta.eql(index.key, expected)) return error.InvalidRecord;
+    return index;
+}
+
+/// Decodes a self-validating record for the library, where reopening every
+/// EPUB merely to reconstruct an expected fingerprint would be inappropriate.
+pub fn decodeStored(input: *const [encoded_size]u8) Error!Index {
+    return decodeStoredLayout(input, .{
+        .magic = "EPI\x02",
+        .encoded_size_units = encoded_size_units,
+        .mask_word_count = mask_word_count,
+        .failed_offset = 44,
+        .counts_offset = counts_offset,
+        .chapter_capacity = max_chapters,
+        .checksum_offset = checksum_offset,
+    });
+}
+
+pub fn decodeLegacy(input: *const [legacy_encoded_size]u8, expected: Key) Error!Index {
+    try validateKey(expected);
+    const index = try decodeLegacyStored(input);
+    if (!std.meta.eql(index.key, expected)) return error.InvalidRecord;
+    return index;
+}
+
+pub fn decodeLegacyStored(input: *const [legacy_encoded_size]u8) Error!Index {
+    return decodeStoredLayout(input, .{
+        .magic = "EPI\x01",
+        .encoded_size_units = legacy_encoded_size_units,
+        .mask_word_count = legacy_mask_word_count,
+        .failed_offset = 36,
+        .counts_offset = legacy_counts_offset,
+        .chapter_capacity = legacy_max_chapters,
+        .checksum_offset = legacy_checksum_offset,
+    });
+}
+
+const DecodeLayout = struct {
+    magic: *const [4]u8,
+    encoded_size_units: u8,
+    mask_word_count: usize,
+    failed_offset: usize,
+    counts_offset: usize,
+    chapter_capacity: usize,
+    checksum_offset: usize,
+};
+
+fn decodeStoredLayout(input: []const u8, layout: DecodeLayout) Error!Index {
+    if (!std.mem.eql(u8, input[0..4], layout.magic)) return error.InvalidRecord;
+    if (input[27] != layout.encoded_size_units) return error.InvalidRecord;
+    if (std.mem.readInt(u32, input[layout.checksum_offset..][0..4], .little) != checksum(input[0..layout.checksum_offset])) return error.InvalidRecord;
 
     const key = Key{
         .book_id = std.mem.readInt(u32, input[4..8], .little),
@@ -219,16 +293,14 @@ pub fn decode(input: *const [encoded_size]u8, expected: Key) Error!Index {
         .word_semantics_revision = std.mem.readInt(u16, input[24..26], .little),
         .spine_len = input[26],
     };
-    if (!std.meta.eql(key, expected)) return error.InvalidRecord;
-
+    if (key.spine_len > layout.chapter_capacity) return error.InvalidSpine;
     var index = try Index.init(key);
-    index.exact.words[0] = std.mem.readInt(u32, input[28..32], .little);
-    index.exact.words[1] = std.mem.readInt(u32, input[32..36], .little);
-    index.failed.words[0] = std.mem.readInt(u32, input[36..40], .little);
-    index.failed.words[1] = std.mem.readInt(u32, input[40..44], .little);
-    for (&index.chapter_words, 0..) |*count, chapter| {
-        const offset = counts_offset + chapter * @sizeOf(u32);
-        count.* = readU32(input, offset);
+    for (0..layout.mask_word_count) |word_index| {
+        index.exact.words[word_index] = readU32(input, 28 + word_index * @sizeOf(u32));
+        index.failed.words[word_index] = readU32(input, layout.failed_offset + word_index * @sizeOf(u32));
+    }
+    for (index.chapter_words[0..layout.chapter_capacity], 0..) |*count, chapter| {
+        count.* = readU32(input, layout.counts_offset + chapter * @sizeOf(u32));
     }
     try validateIndex(index);
     return index;
@@ -272,7 +344,7 @@ fn readU32(bytes: []const u8, offset: usize) u32 {
 }
 
 comptime {
-    std.debug.assert(encoded_size == 304);
+    std.debug.assert(encoded_size == 576);
     std.debug.assert(@alignOf(Index) <= @alignOf(u32));
     std.debug.assert(@sizeOf(Index) <= encoded_size);
 }
@@ -297,6 +369,42 @@ test "index record round trips partial zero and failed chapters" {
     try std.testing.expect(restored.exact.contains(1));
     try std.testing.expectEqual(@as(u32, 0), restored.chapter_words[1]);
     try std.testing.expect(restored.failed.contains(2));
+}
+
+test "128 chapter record preserves upper mask words and counts" {
+    const key = Key{
+        .book_id = 9,
+        .publication_fingerprint = [_]u8{0x3c} ** 16,
+        .word_semantics_revision = 1,
+        .spine_len = 128,
+    };
+    var index = try Index.init(key);
+    try index.setExact(127, 3_129);
+    try index.setFailed(96);
+
+    var bytes: [encoded_size]u8 = undefined;
+    try encode(index, &bytes);
+    const restored = try decode(&bytes, key);
+    try std.testing.expect(restored.exact.contains(127));
+    try std.testing.expectEqual(@as(u32, 3_129), restored.chapter_words[127]);
+    try std.testing.expect(restored.failed.contains(96));
+}
+
+test "legacy 64 chapter records remain readable" {
+    var bytes = [_]u8{0} ** legacy_encoded_size;
+    @memcpy(bytes[0..4], "EPI\x01");
+    std.mem.writeInt(u32, bytes[4..8], test_key.book_id, .little);
+    @memcpy(bytes[8..24], &test_key.publication_fingerprint);
+    std.mem.writeInt(u16, bytes[24..26], test_key.word_semantics_revision, .little);
+    bytes[26] = test_key.spine_len;
+    bytes[27] = legacy_encoded_size_units;
+    writeU32(&bytes, 28, 1);
+    writeU32(&bytes, legacy_counts_offset, 42);
+    writeU32(&bytes, legacy_checksum_offset, checksum(bytes[0..legacy_checksum_offset]));
+
+    const restored = try decodeLegacy(&bytes, test_key);
+    try std.testing.expect(restored.exact.contains(0));
+    try std.testing.expectEqual(@as(u32, 42), restored.chapter_words[0]);
 }
 
 test "record rejects key mask checksum and count inconsistencies" {
@@ -358,6 +466,8 @@ test "chapter and book fractions are exact at first middle and final words" {
     const final = (try index.view(.{ .chapter = 2, .word_ordinal = 29 })).book.exact;
     try std.testing.expectEqual(final.total, final.reached);
     try std.testing.expectEqual(WideCount{}, final.remaining);
+    try std.testing.expectEqual(@as(?u8, 100), index.bookPercent(.{ .chapter = 2, .word_ordinal = 29 }));
+    try std.testing.expectEqual(@as(?u8, 18), index.bookPercent(.{ .chapter = 1, .word_ordinal = 0 }));
 }
 
 test "wide counts report overflow instead of wrapping" {

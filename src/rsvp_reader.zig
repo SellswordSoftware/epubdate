@@ -93,6 +93,14 @@ pub const RsvpReader = struct {
         self.event_count = 0;
     }
 
+    /// Clears text and playback state at a book boundary while preserving the
+    /// user's current speed preference.
+    pub fn resetForBook(self: *RsvpReader) void {
+        const current_wpm = self.wpm;
+        self.initInPlace();
+        self.wpm = current_wpm;
+    }
+
     pub fn beginAtWord(self: *RsvpReader, chapter: u8, word: u32) void {
         self.begin(chapter);
         self.rescan_target = .{ .word = word };
