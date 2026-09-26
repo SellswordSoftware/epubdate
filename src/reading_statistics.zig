@@ -3,6 +3,26 @@ const pace = @import("storage/pace.zig");
 const progress = @import("storage/progress.zig");
 const progress_indexer = @import("progress_indexer.zig");
 
+pub const sheet_enter_ms: u16 = 220;
+pub const sheet_exit_ms: u16 = 160;
+pub const SheetPhase = enum { entering, exiting };
+
+/// Returns the remaining downward displacement for a cubic ease-out entrance.
+pub fn sheetDisplacement(elapsed_ms: u16, travel: u16) u16 {
+    if (elapsed_ms >= sheet_enter_ms) return 0;
+    const remaining: u32 = sheet_enter_ms - elapsed_ms;
+    const duration: u32 = sheet_enter_ms;
+    return @intCast(@as(u32, travel) * remaining * remaining * remaining / (duration * duration * duration));
+}
+
+/// Returns an increasing downward displacement for a cubic ease-in exit.
+pub fn sheetExitDisplacement(elapsed_ms: u16, travel: u16) u16 {
+    if (elapsed_ms >= sheet_exit_ms) return travel;
+    const elapsed: u32 = elapsed_ms;
+    const duration: u32 = sheet_exit_ms;
+    return @intCast(@as(u32, travel) * elapsed * elapsed * elapsed / (duration * duration * duration));
+}
+
 pub const Text = struct {
     bytes: [64]u8 = undefined,
     len: u8 = 0,
@@ -182,4 +202,14 @@ test "statistics formatting distinguishes exact pending failed empty learning an
     try std.testing.expectEqualStrings("Chapter: indexing", view.chapter_progress.slice());
     try std.testing.expectEqualStrings("Book: unavailable", view.book_progress.slice());
     try std.testing.expectEqualStrings("Index: failed (2/2 chapters)", view.index.slice());
+}
+
+test "statistics sheet eases from fully hidden to its resting position" {
+    try std.testing.expectEqual(@as(u16, 204), sheetDisplacement(0, 204));
+    try std.testing.expect(sheetDisplacement(sheet_enter_ms / 2, 204) < 102);
+    try std.testing.expectEqual(@as(u16, 0), sheetDisplacement(sheet_enter_ms, 204));
+
+    try std.testing.expectEqual(@as(u16, 0), sheetExitDisplacement(0, 204));
+    try std.testing.expect(sheetExitDisplacement(sheet_exit_ms / 2, 204) < 102);
+    try std.testing.expectEqual(@as(u16, 204), sheetExitDisplacement(sheet_exit_ms, 204));
 }

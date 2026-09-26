@@ -5,6 +5,7 @@ const pdapi = @import("../playdate_api_definitions.zig");
 const AllocatorStats = @import("playdate_allocator.zig").Stats;
 const reader_coordinator = @import("../reader_coordinator.zig");
 const reader_layout = @import("../reader_layout.zig");
+const reading_statistics = @import("../reading_statistics.zig");
 const progress_rail = @import("../progress_rail.zig");
 const page_transition = @import("../page_transition.zig");
 const TelemetrySnapshot = @import("../telemetry.zig").Telemetry.Snapshot;
@@ -383,25 +384,45 @@ pub const Renderer = struct {
         const max_first: c_int = @intCast(total_rows - visible_rows);
         const thumb_y = track_y + 1 + @divTrunc((inner_height - thumb_height) * @as(c_int, @intCast(first_visible)), max_first);
 
+        self.playdate.graphics.fillRect(track_x, track_y, track_width, track_height, solidColor(self.backgroundColor()));
         self.playdate.graphics.drawRoundRect(track_x, track_y, track_width, track_height, 2, 1, solidColor(self.foregroundColor()));
         self.playdate.graphics.fillRoundRect(track_x + 1, thumb_y, track_width - 2, thumb_height, 1, solidColor(self.foregroundColor()));
     }
 
     fn drawStatistics(self: *Renderer, view: reader_coordinator.StatisticsView) void {
-        self.emphasizedText("Reading statistics", 12, 12);
-        const lines = [_][]const u8{
-            view.chapter_progress.slice(),
-            view.chapter_eta.slice(),
-            view.book_progress.slice(),
-            view.book_eta.slice(),
-            view.pace.slice(),
-            view.index.slice(),
-        };
-        const row_advance = @max(reader_layout.lineAdvance(self.uiFontHeight()), 25);
-        for (lines, 0..) |line, index| {
-            self.text(line, 12, @intCast(38 + index * row_advance));
+        switch (view.backdrop) {
+            .paged => |backdrop| self.drawPage(backdrop),
+            .scroll => |backdrop| self.drawScroll(backdrop),
         }
-        self.text("B: back", 12, 216);
+
+        const sheet_x: c_int = 10;
+        const resting_y: c_int = 28;
+        const sheet_width: c_int = @intCast(reader_layout.screen_width - 20);
+        const sheet_height: c_int = 204;
+        const travel: u16 = @intCast(reader_layout.screen_height - resting_y);
+        const displacement = switch (view.phase) {
+            .entering => reading_statistics.sheetDisplacement(view.elapsed_ms, travel),
+            .exiting => reading_statistics.sheetExitDisplacement(view.elapsed_ms, travel),
+        };
+        const sheet_y = resting_y + @as(c_int, @intCast(displacement));
+
+        self.playdate.graphics.fillRoundRect(sheet_x + 2, sheet_y + 2, sheet_width, sheet_height, 9, solidColor(self.foregroundColor()));
+        self.playdate.graphics.fillRoundRect(sheet_x, sheet_y, sheet_width, sheet_height, 9, solidColor(self.backgroundColor()));
+        self.playdate.graphics.drawRoundRect(sheet_x, sheet_y, sheet_width, sheet_height, 9, 1, solidColor(self.foregroundColor()));
+
+        self.emphasizedText("Reading statistics", sheet_x + 12, sheet_y + 10);
+        const lines = [_][]const u8{
+            view.content.chapter_progress.slice(),
+            view.content.chapter_eta.slice(),
+            view.content.book_progress.slice(),
+            view.content.book_eta.slice(),
+            view.content.pace.slice(),
+            view.content.index.slice(),
+        };
+        const row_advance = @max(reader_layout.lineAdvance(self.uiFontHeight()), 23);
+        for (lines, 0..) |line, index| {
+            self.text(line, sheet_x + 12, sheet_y + 36 + @as(c_int, @intCast(index * row_advance)));
+        }
     }
 
     fn drawChapters(self: *Renderer, view: reader_coordinator.ChaptersView) void {
@@ -635,14 +656,14 @@ fn solidColor(color: pdapi.LCDSolidColor) pdapi.LCDColor {
 }
 
 const library_body_pattern_light = pdapi.LCDPattern{
-    0b11111111,
-    0b00000000,
-    0b11111111,
-    0b00000000,
-    0b11111111,
-    0b00000000,
-    0b11111111,
-    0b00000000,
+    0b11110111,
+    0b11011111,
+    0b01111111,
+    0b11111101,
+    0b11110111,
+    0b11011111,
+    0b01111111,
+    0b11111101,
     0xff,
     0xff,
     0xff,
@@ -654,14 +675,14 @@ const library_body_pattern_light = pdapi.LCDPattern{
 };
 
 const library_body_pattern_dark = pdapi.LCDPattern{
-    0b11111111,
-    0b00000000,
-    0b11111111,
-    0b00000000,
-    0b11111111,
-    0b00000000,
-    0b11111111,
-    0b00000000,
+    0b00001000,
+    0b00100000,
+    0b10000000,
+    0b00000010,
+    0b00001000,
+    0b00100000,
+    0b10000000,
+    0b00000010,
     0xff,
     0xff,
     0xff,

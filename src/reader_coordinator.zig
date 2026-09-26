@@ -230,6 +230,9 @@ pub const ReaderCoordinator = struct {
     page_transition_state: page_transition.State = .{},
     restore_transition_pending: bool = false,
     frame_now_ms: u32 = 0,
+    statistics_opened_at: u32 = 0,
+    statistics_closing: bool = false,
+    reduce_flashing: bool = false,
     crank_docked: bool = false,
     reset_hold_started_at: ?u32 = null,
     reset_hold_elapsed_ms: u16 = 0,
@@ -293,6 +296,9 @@ pub const ReaderCoordinator = struct {
         self.page_transition_state = .{};
         self.restore_transition_pending = false;
         self.frame_now_ms = 0;
+        self.statistics_opened_at = 0;
+        self.statistics_closing = false;
+        self.reduce_flashing = false;
         self.crank_docked = false;
         self.reset_hold_started_at = null;
         self.reset_hold_elapsed_ms = 0;
@@ -557,17 +563,32 @@ pub const ReaderCoordinator = struct {
     }
 
     pub fn openReadingStatistics(self: *ReaderCoordinator, now_ms: u32) bool {
-        if (self.screen != .reading) return false;
+        if (self.screen != .reading or self.mode != .paged) return false;
         self.manual_pace.discard();
         self.stopAutoplayAccounting(now_ms);
+        self.page_transition_state.cancel();
+        self.statistics_opened_at = now_ms;
+        self.statistics_closing = false;
         self.screen = .statistics;
         return true;
     }
 
-    pub fn closeStatistics(self: *ReaderCoordinator) bool {
-        if (self.screen != .statistics) return false;
-        self.screen = .reading;
+    pub fn closeStatistics(self: *ReaderCoordinator, now_ms: u32) bool {
+        if (self.screen != .statistics or self.statistics_closing) return false;
+        if (self.reduce_flashing) {
+            self.screen = .reading;
+            return true;
+        }
+        self.statistics_closing = true;
+        self.statistics_opened_at = now_ms;
         return true;
+    }
+
+    fn advanceStatisticsTransition(self: *ReaderCoordinator, now_ms: u32) void {
+        if (self.screen != .statistics or !self.statistics_closing) return;
+        if (!self.reduce_flashing and now_ms -% self.statistics_opened_at < reading_statistics.sheet_exit_ms) return;
+        self.statistics_closing = false;
+        self.screen = .reading;
     }
 
     pub fn openChapterBrowser(self: *ReaderCoordinator) bool {
@@ -1478,6 +1499,7 @@ pub const ReaderCoordinator = struct {
     /// all platform I/O remains behind ReaderHost.
     pub fn update(self: *ReaderCoordinator, frame: FrameInput, now_ms: u32) void {
         self.frame_now_ms = now_ms;
+        self.reduce_flashing = frame.reduce_flashing;
         const transition_from = self.pagedFramePosition();
         self.updateCrankDockState(frame.crank_docked);
         const intent = intentFor(.{
@@ -1488,6 +1510,7 @@ pub const ReaderCoordinator = struct {
             .buttons = frame.buttons,
         });
         self.performIntent(intent, now_ms);
+        self.advanceStatisticsTransition(now_ms);
         self.updateResetHold(frame.a_held, frame.buttons.a, now_ms);
         self.handleCrank(frame.crank_change, now_ms);
         self.advanceAutoplay(now_ms);
@@ -1654,7 +1677,7 @@ pub const ReaderCoordinator = struct {
             .open_settings => _ = self.openSettings(),
             .open_statistics => _ = self.openReadingStatistics(now_ms),
             .close_settings => _ = self.closeSettings(),
-            .close_statistics => _ = self.closeStatistics(),
+            .close_statistics => _ = self.closeStatistics(now_ms),
             .close_chapter_browser => {
                 _ = self.closeChapterBrowser();
                 self.crank_accumulated = 0;
@@ -2032,6 +2055,81 @@ pub const ReaderCoordinator = struct {
         self.lifecycle = .ready;
     }
 
+    fn scrollView(self: *ReaderCoordinator) ScrollView {
+        return .{
+            .window = self.paged.scrollRenderState(self.paged.scrollPosition(), self.scrollGeometry()),
+            .progress = self.progressView(),
+            .progress_visibility = self.progress_visibility,
+            .progress_position = self.progress_position,
+            .progress_scope = self.progress_scope,
+        };
+    }
+
+    fn pagedView(self: *ReaderCoordinator) PagedView {
+        const state = self.paged.renderState();
+        var lines = [_][]const u8{""} ** pagination.max_lines;
+        var line_count: u8 = 0;
+        var selected_span: ?pagination.PageCache.WordSpan = null;
+        if (state.page) |page| {
+            line_count = page.line_count;
+            for (0..page.line_count) |index| lines[index] = page.line(index);
+            if (page.moveSelection(state.selected_word_ordinal, 0)) |selected| {
+                self.paged.selected_word_ordinal = selected;
+                if (!self.crank_docked) selected_span = page.wordSpan(selected);
+            }
+        }
+        var transition: ?PageTransitionView = null;
+        if (self.page_transition_state.elapsed(self.frame_now_ms)) |elapsed_ms| {
+            var outgoing_lines = [_][]const u8{""} ** pagination.max_lines;
+            var outgoing_line_count: u8 = 0;
+            var source_ready = true;
+            if (self.page_transition_state.source_page) |source_page| {
+                if (self.paged.cachedPage(source_page)) |outgoing| {
+                    outgoing_line_count = outgoing.line_count;
+                    for (0..outgoing.line_count) |index| outgoing_lines[index] = outgoing.line(index);
+                } else source_ready = false;
+            }
+            if (source_ready) {
+                transition = .{
+                    .lines = outgoing_lines,
+                    .line_count = outgoing_line_count,
+                    .direction = self.page_transition_state.direction,
+                    .elapsed_ms = elapsed_ms,
+                };
+            } else self.page_transition_state.cancel();
+        }
+        return .{
+            .lines = lines,
+            .line_count = line_count,
+            .selected_span = selected_span,
+            .page_index = state.page_index,
+            .waiting = state.waiting_for_page,
+            .reconstructing = state.reconstructing,
+            .transition = transition,
+            .progress = self.progressView(),
+            .progress_visibility = self.progress_visibility,
+            .progress_position = self.progress_position,
+            .progress_scope = self.progress_scope,
+        };
+    }
+
+    fn rsvpView(self: *ReaderCoordinator) RsvpView {
+        const state = self.rsvp_reader.renderState();
+        const anchor = if (state.word) |word| rsvp.anchorBytes(word) else null;
+        return .{
+            .word = state.word,
+            .anchor = if (anchor) |span| .{ .start = span.start, .end = span.end } else null,
+            .waiting = state.waiting,
+            .reconstructing = self.rsvp_reader.isReconstructing(),
+            .playing = state.playing,
+            .wpm = state.wpm,
+            .progress = self.progressView(),
+            .progress_visibility = self.progress_visibility,
+            .progress_position = self.progress_position,
+            .progress_scope = self.progress_scope,
+        };
+    }
+
     pub fn renderModel(self: *ReaderCoordinator) RenderModel {
         switch (self.screen) {
             .library => {
@@ -2062,12 +2160,26 @@ pub const ReaderCoordinator = struct {
             .statistics => {
                 const index = self.progress_worker.snapshot();
                 const chapter_count = if (index) |value| value.key.spine_len else 0;
-                return .{ .statistics = reading_statistics.format(
-                    self.progressView(),
-                    self.pace,
-                    self.progress_worker.status(),
-                    chapter_count,
-                ) };
+                const phase: reading_statistics.SheetPhase = if (self.statistics_closing) .exiting else .entering;
+                const duration = if (self.statistics_closing) reading_statistics.sheet_exit_ms else reading_statistics.sheet_enter_ms;
+                const elapsed = if (self.reduce_flashing)
+                    duration
+                else
+                    @min(self.frame_now_ms -% self.statistics_opened_at, duration);
+                return .{ .statistics = .{
+                    .content = reading_statistics.format(
+                        self.progressView(),
+                        self.pace,
+                        self.progress_worker.status(),
+                        chapter_count,
+                    ),
+                    .backdrop = if (self.paged_presentation == .scroll)
+                        .{ .scroll = self.scrollView() }
+                    else
+                        .{ .paged = self.pagedView() },
+                    .phase = phase,
+                    .elapsed_ms = @intCast(elapsed),
+                } };
             },
             .chapter_browser => {
                 var rows = [_]ChapterRowView{.{}} ** chapter_browser.visible_rows;
@@ -2097,76 +2209,11 @@ pub const ReaderCoordinator = struct {
         return switch (self.lifecycle) {
             .opening => .opening,
             .ready => switch (self.mode) {
-                .paged => blk: {
-                    if (self.paged_presentation == .scroll) break :blk .{ .scroll = .{
-                        .window = self.paged.scrollRenderState(self.paged.scrollPosition(), self.scrollGeometry()),
-                        .progress = self.progressView(),
-                        .progress_visibility = self.progress_visibility,
-                        .progress_position = self.progress_position,
-                        .progress_scope = self.progress_scope,
-                    } };
-                    const state = self.paged.renderState();
-                    var lines = [_][]const u8{""} ** pagination.max_lines;
-                    var line_count: u8 = 0;
-                    var selected_span: ?pagination.PageCache.WordSpan = null;
-                    if (state.page) |page| {
-                        line_count = page.line_count;
-                        for (0..page.line_count) |index| lines[index] = page.line(index);
-                        if (self.paged_presentation == .pages) if (page.moveSelection(state.selected_word_ordinal, 0)) |selected| {
-                            self.paged.selected_word_ordinal = selected;
-                            if (!self.crank_docked) selected_span = page.wordSpan(selected);
-                        };
-                    }
-                    var transition: ?PageTransitionView = null;
-                    if (self.page_transition_state.elapsed(self.frame_now_ms)) |elapsed_ms| {
-                        var outgoing_lines = [_][]const u8{""} ** pagination.max_lines;
-                        var outgoing_line_count: u8 = 0;
-                        var source_ready = true;
-                        if (self.page_transition_state.source_page) |source_page| {
-                            if (self.paged.cachedPage(source_page)) |outgoing| {
-                                outgoing_line_count = outgoing.line_count;
-                                for (0..outgoing.line_count) |index| outgoing_lines[index] = outgoing.line(index);
-                            } else source_ready = false;
-                        }
-                        if (source_ready) {
-                            transition = .{
-                                .lines = outgoing_lines,
-                                .line_count = outgoing_line_count,
-                                .direction = self.page_transition_state.direction,
-                                .elapsed_ms = elapsed_ms,
-                            };
-                        } else self.page_transition_state.cancel();
-                    }
-                    break :blk .{ .paged = .{
-                        .lines = lines,
-                        .line_count = line_count,
-                        .selected_span = selected_span,
-                        .page_index = state.page_index,
-                        .waiting = state.waiting_for_page,
-                        .reconstructing = state.reconstructing,
-                        .transition = transition,
-                        .progress = self.progressView(),
-                        .progress_visibility = self.progress_visibility,
-                        .progress_position = self.progress_position,
-                        .progress_scope = self.progress_scope,
-                    } };
-                },
-                .rsvp => blk: {
-                    const state = self.rsvp_reader.renderState();
-                    const anchor = if (state.word) |word| rsvp.anchorBytes(word) else null;
-                    break :blk .{ .rsvp = .{
-                        .word = state.word,
-                        .anchor = if (anchor) |span| .{ .start = span.start, .end = span.end } else null,
-                        .waiting = state.waiting,
-                        .reconstructing = self.rsvp_reader.isReconstructing(),
-                        .playing = state.playing,
-                        .wpm = state.wpm,
-                        .progress = self.progressView(),
-                        .progress_visibility = self.progress_visibility,
-                        .progress_position = self.progress_position,
-                        .progress_scope = self.progress_scope,
-                    } };
-                },
+                .paged => if (self.paged_presentation == .scroll)
+                    .{ .scroll = self.scrollView() }
+                else
+                    .{ .paged = self.pagedView() },
+                .rsvp => .{ .rsvp = self.rsvpView() },
             },
             .unavailable => .{ .failure = .unavailable },
             .invalid_archive => .{ .failure = .{ .invalid_archive = self.opening_failure } },
@@ -2425,7 +2472,17 @@ pub const RenderModel = union(enum) {
     failure: ErrorView,
 };
 
-pub const StatisticsView = reading_statistics.View;
+pub const StatisticsBackdrop = union(enum) {
+    paged: PagedView,
+    scroll: ScrollView,
+};
+
+pub const StatisticsView = struct {
+    content: reading_statistics.View,
+    backdrop: StatisticsBackdrop,
+    phase: reading_statistics.SheetPhase,
+    elapsed_ms: u16,
+};
 
 pub const SettingsView = struct {
     selected: SettingsRow,
@@ -3322,7 +3379,7 @@ test "scrolling settings keeps every selection visible and reset hold uninterrup
     try std.testing.expectEqual(Screen.library, coordinator.screen);
 }
 
-test "Down opens reading statistics and B resumes reading" {
+test "Down opens reading statistics and dismissal animates before resuming" {
     var coordinator: ReaderCoordinator = undefined;
     coordinator.initInPlace(128);
     coordinator.beginReading();
@@ -3340,6 +3397,9 @@ test "Down opens reading statistics and B resumes reading" {
         .mode = coordinator.mode,
         .buttons = .{ .b = true },
     }), 11);
+    try std.testing.expectEqual(Screen.statistics, coordinator.screen);
+    try std.testing.expect(coordinator.statistics_closing);
+    coordinator.advanceStatisticsTransition(11 + reading_statistics.sheet_exit_ms);
     try std.testing.expectEqual(Screen.reading, coordinator.screen);
 }
 

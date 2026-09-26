@@ -52,7 +52,7 @@ pub const Intent = enum {
 
 pub fn intentFor(snapshot: Snapshot) Intent {
     if (snapshot.screen == .statistics) {
-        if (snapshot.buttons.b) return .close_statistics;
+        if (snapshot.buttons.b or snapshot.buttons.down) return .close_statistics;
         return .none;
     }
     if (snapshot.screen == .settings) {
@@ -129,6 +129,15 @@ test "Paged reading reserves Up and Down for library and statistics" {
     try std.testing.expectEqual(Intent.rsvp_wpm_up, intentFor(snapshot));
     snapshot.buttons = .{ .down = true };
     try std.testing.expectEqual(Intent.rsvp_wpm_down, intentFor(snapshot));
+}
+
+test "B and Down both dismiss reading statistics" {
+    const base = Snapshot{ .screen = .statistics, .readiness = .ready, .mode = .paged, .buttons = .{} };
+    var snapshot = base;
+    snapshot.buttons.b = true;
+    try std.testing.expectEqual(Intent.close_statistics, intentFor(snapshot));
+    snapshot.buttons = .{ .down = true };
+    try std.testing.expectEqual(Intent.close_statistics, intentFor(snapshot));
 }
 
 test "reading gives the mode toggle priority over page navigation" {
