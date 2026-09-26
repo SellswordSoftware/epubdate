@@ -163,6 +163,7 @@ pub const FrameInput = struct {
 
 pub const SystemAction = enum { settings, chapters };
 const PagedSelectionMove = enum { advanced, waiting_for_page, at_limit };
+const ScrollRestoreTarget = union(enum) { page: u32, word: u32 };
 
 /// Owns UI lifecycle transitions. Reader engines report readiness and semantic
 /// navigation; the coordinator owns which screen is currently active.
@@ -229,6 +230,7 @@ pub const ReaderCoordinator = struct {
     scroll_crank_millidegrees: i32 = 0,
     page_transition_state: page_transition.State = .{},
     restore_transition_pending: bool = false,
+    scroll_restore_pending: ?ScrollRestoreTarget = null,
     frame_now_ms: u32 = 0,
     statistics_opened_at: u32 = 0,
     statistics_closing: bool = false,
@@ -295,6 +297,7 @@ pub const ReaderCoordinator = struct {
         self.scroll_crank_millidegrees = 0;
         self.page_transition_state = .{};
         self.restore_transition_pending = false;
+        self.scroll_restore_pending = null;
         self.frame_now_ms = 0;
         self.statistics_opened_at = 0;
         self.statistics_closing = false;
@@ -459,6 +462,7 @@ pub const ReaderCoordinator = struct {
                 const chapter: u8 = @intCast(legacy.chapter);
                 if (self.mode == .paged) {
                     self.restore_transition_pending = self.paged_presentation == .pages;
+                    if (self.paged_presentation == .scroll) self.scroll_restore_pending = .{ .page = legacy.page };
                     self.openChapter(chapter, if (legacy.page == 0) .normal else .{ .rescan = legacy.page });
                 } else self.openChapter(chapter, .normal);
             },
@@ -469,6 +473,7 @@ pub const ReaderCoordinator = struct {
                 switch (self.mode) {
                     .paged => {
                         self.restore_transition_pending = self.paged_presentation == .pages;
+                        if (self.paged_presentation == .scroll) self.scroll_restore_pending = .{ .word = snapshot.word_ordinal };
                         self.paged.pending_selection = .{ .ordinal = snapshot.word_ordinal };
                         self.openChapter(chapter, .{ .word_rescan = snapshot.word_ordinal });
                     },
@@ -539,6 +544,7 @@ pub const ReaderCoordinator = struct {
         self.scroll_crank_millidegrees = 0;
         self.page_transition_state.cancel();
         self.restore_transition_pending = false;
+        self.scroll_restore_pending = null;
         self.clearResetHold();
         self.returnToLibrary();
         self.lifecycle = .opening;
@@ -708,6 +714,7 @@ pub const ReaderCoordinator = struct {
         self.rsvp_reader.resetForBook();
         self.page_transition_state.cancel();
         self.restore_transition_pending = false;
+        self.scroll_restore_pending = null;
         self.position_save_suppressed = false;
         self.clearResetHold();
         const book_id = persistence.Service.bookIdentity(self.active_book.slice());
@@ -1525,6 +1532,7 @@ pub const ReaderCoordinator = struct {
         self.resumeScrollBackwardAfterChapterWork(chapter.worked);
         if (chapter.request_prefetch) _ = self.startPrefetch();
         self.fulfillPendingPagedSelection();
+        self.resolveScrollRestoreBarrier();
         if (self.mode == .paged and !self.crank_docked) {
             if (self.paged_presentation == .scroll) self.drainScrollDetents(now_ms) else self.drainPagedDetents(now_ms);
         }
@@ -2031,6 +2039,20 @@ pub const ReaderCoordinator = struct {
         self.requestPositionSave();
     }
 
+    fn resolveScrollRestoreBarrier(self: *ReaderCoordinator) void {
+        const target = self.scroll_restore_pending orelse return;
+        switch (target) {
+            .word => {
+                // A completed word restore clears pending_selection, including
+                // the verified-EOF fallback to the chapter's last word.
+                if (self.paged.current_ready and self.paged.pending_selection == null) self.scroll_restore_pending = null;
+            },
+            .page => |page| {
+                if (self.paged.current_ready and self.paged.page_index == page) self.scroll_restore_pending = null;
+            },
+        }
+    }
+
     fn handleRsvpMove(self: *ReaderCoordinator, move: rsvp_reader.RsvpReader.Move) void {
         switch (move) {
             .moved => self.requestPositionSaveAfterReadingMovement(),
@@ -2058,6 +2080,7 @@ pub const ReaderCoordinator = struct {
     fn scrollView(self: *ReaderCoordinator) ScrollView {
         return .{
             .window = self.paged.scrollRenderState(self.paged.scrollPosition(), self.scrollGeometry()),
+            .restoring = self.scroll_restore_pending != null,
             .progress = self.progressView(),
             .progress_visibility = self.progress_visibility,
             .progress_position = self.progress_position,
@@ -2232,6 +2255,10 @@ pub const ReaderCoordinator = struct {
 
     pub fn telemetrySnapshot(self: *const ReaderCoordinator) ?telemetry.Telemetry.Snapshot {
         return if (self.telemetry.enabled) self.telemetry.snapshot() else null;
+    }
+
+    pub fn reduceFlashing(self: *const ReaderCoordinator) bool {
+        return self.reduce_flashing;
     }
 
     pub fn setTelemetryEnabled(self: *ReaderCoordinator, enabled: bool) void {
@@ -2434,6 +2461,7 @@ pub const PageTransitionView = struct {
 /// contain no owned text and leave all cache policy inside `PagedReader`.
 pub const ScrollView = struct {
     window: paged_reader.PagedReader.ScrollRenderState,
+    restoring: bool = false,
     progress: ?reading_progress.View = null,
     progress_visibility: ProgressVisibility = .off,
     progress_position: ProgressPosition = .top,
@@ -2659,6 +2687,34 @@ test "restored Scroll selection anchors its target page instead of stale history
 
     try std.testing.expectEqual(@as(u32, 5), coordinator.paged.scrollPosition().top_page);
     try std.testing.expectEqual(scroll_geometry.Geometry.init(20).line_advance, coordinator.paged.scrollPosition().offset_px);
+}
+
+test "Scroll restoration hides the provisional chapter start until its word resolves" {
+    var coordinator: ReaderCoordinator = undefined;
+    coordinator.initInPlace(128);
+    coordinator.screen = .reading;
+    coordinator.lifecycle = .ready;
+    coordinator.paged_presentation = .scroll;
+    coordinator.paged.current_ready = true;
+    coordinator.paged.current_page = 0;
+    coordinator.paged.page_index = 0;
+    try coordinator.paged.pages[0].appendLineWithMetadata("provisional", 0, 1);
+    coordinator.paged.pages[0].word_count = 1;
+    coordinator.paged.slots[0] = .{ .role = .displayed, .chapter = 0, .page = 0 };
+    coordinator.paged.pending_selection = .{ .ordinal = 20 };
+    coordinator.scroll_restore_pending = .{ .word = 20 };
+
+    switch (coordinator.renderModel()) {
+        .scroll => |view| try std.testing.expect(view.restoring),
+        else => return error.TestUnexpectedResult,
+    }
+
+    coordinator.paged.pending_selection = null;
+    coordinator.resolveScrollRestoreBarrier();
+    switch (coordinator.renderModel()) {
+        .scroll => |view| try std.testing.expect(!view.restoring),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "coordinator enters a rebuilt Scroll predecessor after chapter work" {

@@ -95,7 +95,7 @@ pub const App = struct {
         self.syncSystemMenu();
 
         self.renderer.beginFrame(self.coordinator.theme, self.coordinator.pages_font, self.coordinator.rsvp_font);
-        self.renderer.draw(self.coordinator.renderModel(), self.allocator.stats);
+        self.renderer.draw(self.coordinator.renderModel(), self.allocator.stats, started_at, self.coordinator.reduceFlashing());
         if (self.coordinator.telemetrySnapshot()) |snapshot| self.renderer.drawTelemetry(snapshot, self.allocator.stats);
         return 1;
     }

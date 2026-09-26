@@ -8,6 +8,7 @@ const reader_layout = @import("../reader_layout.zig");
 const reading_statistics = @import("../reading_statistics.zig");
 const progress_rail = @import("../progress_rail.zig");
 const page_transition = @import("../page_transition.zig");
+const screen_transition = @import("../screen_transition.zig");
 const TelemetrySnapshot = @import("../telemetry.zig").Telemetry.Snapshot;
 
 /// The only layer that translates reader drawing primitives into Playdate
@@ -32,6 +33,10 @@ pub const Renderer = struct {
     library_marquee_len: usize = 0,
     library_marquee_width: c_int = 0,
     library_marquee_frame: u16 = 0,
+    last_rendered_view: ?u64 = null,
+    last_rendered_kind: ?RenderViewKind = null,
+    screen_transition_state: screen_transition.State = .{},
+    screen_transition_source: ?*pdapi.LCDBitmap = null,
 
     pub fn init(
         playdate: *pdapi.PlaydateAPI,
@@ -105,7 +110,39 @@ pub const Renderer = struct {
         return self.playdate.graphics.getFontHeight(self.readingFont(font));
     }
 
-    pub fn draw(self: *Renderer, model: reader_coordinator.RenderModel, allocator_stats: AllocatorStats) void {
+    pub fn draw(self: *Renderer, model: reader_coordinator.RenderModel, allocator_stats: AllocatorStats, now_ms: u32, reduce_flashing: bool) void {
+        const view = renderViewId(model);
+        const kind = renderViewKind(model);
+        if (reduce_flashing) {
+            self.cancelScreenTransition();
+        } else if (self.last_rendered_view) |previous_view| {
+            if (previous_view != view and transitionsBetween(self.last_rendered_kind.?, kind)) self.beginScreenTransition(now_ms);
+        }
+        self.last_rendered_view = view;
+        self.last_rendered_kind = kind;
+
+        switch (self.screen_transition_state.phase(now_ms)) {
+            .outgoing => |pattern| {
+                if (self.screen_transition_source) |source| {
+                    self.playdate.graphics.setDrawMode(.DrawModeCopy);
+                    self.playdate.graphics.drawBitmap(source, 0, 0, .BitmapUnflipped);
+                    self.applyDither(source, pattern);
+                    self.playdate.graphics.setDrawMode(self.textDrawMode());
+                    return;
+                }
+            },
+            .background => return,
+            .incoming => |pattern| {
+                self.drawModel(model, allocator_stats);
+                self.applyDitherToFrame(pattern);
+                return;
+            },
+            .complete => self.cancelScreenTransition(),
+        }
+        self.drawModel(model, allocator_stats);
+    }
+
+    fn drawModel(self: *Renderer, model: reader_coordinator.RenderModel, allocator_stats: AllocatorStats) void {
         switch (model) {
             .library => |view| self.drawLibrary(view),
             .settings => |view| self.drawSettings(view),
@@ -116,6 +153,71 @@ pub const Renderer = struct {
             .scroll => |view| self.drawScroll(view),
             .rsvp => |view| self.drawRsvp(view),
             .failure => |view| self.drawFailure(view, allocator_stats),
+        }
+    }
+
+    fn beginScreenTransition(self: *Renderer, now_ms: u32) void {
+        self.cancelScreenTransition();
+        const source = self.playdate.graphics.newBitmap(
+            @intCast(reader_layout.screen_width),
+            @intCast(reader_layout.screen_height),
+            solidColor(self.backgroundColor()),
+        ) orelse return;
+        var width: c_int = 0;
+        var height: c_int = 0;
+        var row_bytes: c_int = 0;
+        var data: [*c]u8 = null;
+        self.playdate.graphics.getBitmapData(source, &width, &height, &row_bytes, null, &data);
+        if (data == null) {
+            self.playdate.graphics.freeBitmap(source);
+            return;
+        }
+        const displayed = self.playdate.graphics.getDisplayFrame();
+        const rows = @min(@as(usize, @intCast(height)), @as(usize, reader_layout.screen_height));
+        const byte_width = @min(@as(usize, @intCast(width)) / 8, @as(usize, pdapi.LCD_ROWSIZE));
+        const destination_row_bytes: usize = @intCast(row_bytes);
+        for (0..rows) |y| {
+            std.mem.copyForwards(u8, data[y * destination_row_bytes ..][0..byte_width], displayed[y * pdapi.LCD_ROWSIZE ..][0..byte_width]);
+        }
+        self.screen_transition_source = source;
+        self.screen_transition_state.begin(now_ms);
+    }
+
+    fn cancelScreenTransition(self: *Renderer) void {
+        self.screen_transition_state.cancel();
+        if (self.screen_transition_source) |source| self.playdate.graphics.freeBitmap(source);
+        self.screen_transition_source = null;
+    }
+
+    /// Replaces selected source pixels with the active theme background. The
+    /// source bitmap is captured from the prior displayed frame; the incoming
+    /// half applies the same operation to the newly rendered framebuffer.
+    fn applyDither(self: *Renderer, source: *pdapi.LCDBitmap, pattern: u8) void {
+        var width: c_int = 0;
+        var height: c_int = 0;
+        var row_bytes: c_int = 0;
+        var data: [*c]u8 = null;
+        self.playdate.graphics.getBitmapData(source, &width, &height, &row_bytes, null, &data);
+        if (data == null) return;
+        self.applyDitherBytes(data, @intCast(width), @intCast(height), @intCast(row_bytes), pattern);
+    }
+
+    fn applyDitherToFrame(self: *Renderer, pattern: u8) void {
+        self.applyDitherBytes(self.playdate.graphics.getFrame(), reader_layout.screen_width, reader_layout.screen_height, pdapi.LCD_ROWSIZE, pattern);
+    }
+
+    fn applyDitherBytes(self: *Renderer, source: [*]u8, width: usize, height: usize, source_row_bytes: usize, pattern: u8) void {
+        const frame = self.playdate.graphics.getFrame();
+        // Playdate framebuffer bits are 1 for white and 0 for black.
+        const background: u8 = if (self.theme == .dark) 0x00 else 0xff;
+        const byte_width = @min(width / 8, @as(usize, pdapi.LCD_ROWSIZE));
+        const rows = @min(height, @as(usize, reader_layout.screen_height));
+        const selected = screen_transition.patterns[pattern];
+        for (0..rows) |y| {
+            const mask = selected[y & 7];
+            for (0..byte_width) |x| {
+                frame[y * pdapi.LCD_ROWSIZE + x] = (source[y * source_row_bytes + x] & mask) | (background & ~mask);
+            }
         }
     }
 
@@ -451,8 +553,10 @@ pub const Renderer = struct {
         const font_height = self.readingFontHeight(font);
         const line_advance = reader_layout.lineAdvance(font_height);
         if (view.transition) |transition| {
-            self.drawPageTransition(view, transition, font, line_advance);
-            return;
+            if (!self.screen_transition_state.active) {
+                self.drawPageTransition(view, transition, font, line_advance);
+                return;
+            }
         }
         self.drawPageLines(&view.lines, view.line_count, font, line_advance, 0);
         const span = view.selected_span orelse return;
@@ -515,11 +619,15 @@ pub const Renderer = struct {
             self.readingText(font, word, x, @intCast(geometry.word_y));
         } else self.readingText(font, word, @intCast(reader_layout.text_x), @intCast(geometry.word_y));
         self.text("A: play  Up/Down: WPM", 12, 192);
-        self.text("Left: sentence  B: Paged", 12, 216);
+        self.text("Left: prev sentence  B: back", 12, 216);
     }
 
     fn drawScroll(self: *Renderer, view: reader_coordinator.ScrollView) void {
         self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
+        if (view.restoring) {
+            self.text("Restoring position...", 12, 12);
+            return;
+        }
         const top: c_int = @intCast(reader_layout.text_y);
         const height: c_int = @intCast(reader_layout.screen_height - reader_layout.text_y - reader_layout.reserved_edge_rows);
         self.playdate.graphics.setClipRect(@intCast(reader_layout.text_x), top, @intCast(reader_layout.text_width), height);
@@ -695,6 +803,75 @@ const library_body_pattern_dark = pdapi.LCDPattern{
 
 fn patternColor(pattern: *const pdapi.LCDPattern) pdapi.LCDColor {
     return @intFromPtr(pattern);
+}
+
+fn renderViewId(model: reader_coordinator.RenderModel) u64 {
+    return switch (model) {
+        .library => 1,
+        .opening => 2,
+        .paged => |view| @as(u64, 0x10_0000_0000) | @as(u64, view.page_index),
+        .scroll => 4,
+        .rsvp => 5,
+        .settings => 6,
+        .statistics => 7,
+        .chapters => 8,
+        .failure => 9,
+    };
+}
+
+const RenderViewKind = enum {
+    library,
+    opening,
+    paged,
+    scroll,
+    rsvp,
+    settings,
+    statistics,
+    chapters,
+    failure,
+};
+
+fn renderViewKind(model: reader_coordinator.RenderModel) RenderViewKind {
+    return switch (model) {
+        .library => .library,
+        .opening => .opening,
+        .paged => .paged,
+        .scroll => .scroll,
+        .rsvp => .rsvp,
+        .settings => .settings,
+        .statistics => .statistics,
+        .chapters => .chapters,
+        .failure => .failure,
+    };
+}
+
+fn transitionsBetween(previous: RenderViewKind, next: RenderViewKind) bool {
+    if (previous == .settings or next == .settings) {
+        const other = if (previous == .settings) next else previous;
+        return other == .library or isReadingView(other);
+    }
+    if (previous == .library or next == .library) return isReadingView(if (previous == .library) next else previous);
+    return (previous == .rsvp and isPagedView(next)) or (next == .rsvp and isPagedView(previous));
+}
+
+fn isReadingView(view: RenderViewKind) bool {
+    return view == .opening or isPagedView(view) or view == .rsvp;
+}
+
+fn isPagedView(view: RenderViewKind) bool {
+    return view == .paged or view == .scroll;
+}
+
+test "screen fade only covers the selected navigation boundaries" {
+    try std.testing.expect(transitionsBetween(.library, .opening));
+    try std.testing.expect(transitionsBetween(.paged, .rsvp));
+    try std.testing.expect(transitionsBetween(.rsvp, .scroll));
+    try std.testing.expect(transitionsBetween(.settings, .library));
+    try std.testing.expect(transitionsBetween(.paged, .settings));
+    try std.testing.expect(!transitionsBetween(.paged, .paged));
+    try std.testing.expect(!transitionsBetween(.opening, .paged));
+    try std.testing.expect(!transitionsBetween(.paged, .statistics));
+    try std.testing.expect(!transitionsBetween(.chapters, .paged));
 }
 
 fn nextUtf8Boundary(value: []const u8, start: usize, limit: usize) usize {

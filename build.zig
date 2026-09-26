@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) !void {
         "src/reader_transitions.zig",
         "src/scroll_geometry.zig",
         "src/page_transition.zig",
+        "src/screen_transition.zig",
         "src/paged_reader.zig",
         "src/rsvp_reader.zig",
         "src/reader_coordinator.zig",
