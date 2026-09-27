@@ -1,6 +1,6 @@
 pub const Row = enum(u4) {
-    paged_presentation,
     theme,
+    paged_presentation,
     pages_font,
     rsvp_font,
     progress_visibility,
@@ -28,7 +28,7 @@ test "settings keep seven rows visible while the final row scrolls into view" {
 }
 
 pub const Model = struct {
-    selected: Row = .paged_presentation,
+    selected: Row = .theme,
     first_visible: u4 = 0,
     available_rows: u4 = row_count,
 

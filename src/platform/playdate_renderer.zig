@@ -525,12 +525,26 @@ pub const Renderer = struct {
     }
 
     fn drawSettings(self: *Renderer, view: *const reader_coordinator.SettingsView) void {
+        const screen_width: c_int = @intCast(reader_layout.screen_width);
+        const screen_height: c_int = @intCast(reader_layout.screen_height);
+        const header_height: c_int = 36;
+        const footer_y: c_int = 210;
+        const row_y: c_int = 43;
+        const row_height: c_int = 22;
+        const row_advance: c_int = 24;
+
+        self.playdate.graphics.setDrawMode(.DrawModeCopy);
+        self.playdate.graphics.fillRect(0, 0, screen_width, screen_height, self.libraryBodyPatternColor());
+        self.playdate.graphics.fillRect(0, 0, screen_width, header_height, solidColor(self.backgroundColor()));
+        self.playdate.graphics.fillRect(0, footer_y, screen_width, screen_height - footer_y, solidColor(self.backgroundColor()));
+        self.playdate.graphics.fillRect(0, header_height - 1, screen_width, 1, solidColor(self.foregroundColor()));
+        self.playdate.graphics.fillRect(0, footer_y, screen_width, 1, solidColor(self.foregroundColor()));
+        self.playdate.graphics.setDrawMode(self.textDrawMode());
         self.emphasizedText("Settings", 12, 12);
-        const row_advance = @max(reader_layout.lineAdvance(self.uiFontHeight()), 24);
+
         for (0..view.row_count) |visible_index| {
             const row: reader_coordinator.SettingsRow = @enumFromInt(view.first_visible + @as(u4, @intCast(visible_index)));
-            const y: c_int = @intCast(36 + visible_index * row_advance);
-            self.text(if (row == view.selected) ">" else " ", 6, y);
+            const y = row_y + @as(c_int, @intCast(visible_index)) * row_advance;
             const label = switch (row) {
                 .paged_presentation => "Progression",
                 .theme => "Theme",
@@ -556,23 +570,44 @@ pub const Renderer = struct {
                 },
                 .reset_progress => "Hold A 3s",
             };
-            self.rightAlignedUiText(value, y, row == view.selected);
+            self.drawSettingsItem(label, value, row == view.selected, row == .reset_progress, view.reset_hold_ms, y, row_height);
         }
         self.drawSettingsScrollbar(view);
+        self.text(if (view.selected == .reset_progress) "Hold A: reset     B: back" else "A: change     B: back", 12, 217);
+    }
 
-        if (view.selected == .reset_progress and view.reset_hold_ms != 0) {
-            const bar_x: c_int = 12;
-            const bar_y: c_int = 203;
-            const bar_width: c_int = 376;
-            self.playdate.graphics.drawRect(bar_x, bar_y, bar_width, 7, solidColor(self.foregroundColor()));
-            const progress: c_int = @intCast((@as(u32, view.reset_hold_ms) * @as(u32, @intCast(bar_width - 2))) / reader_coordinator.reset_hold_duration_ms);
-            if (progress > 0) self.playdate.graphics.fillRect(bar_x + 1, bar_y + 1, progress, 5, solidColor(self.foregroundColor()));
+    fn drawSettingsItem(self: *Renderer, label: []const u8, value: []const u8, selected: bool, is_reset: bool, reset_hold_ms: u16, y: c_int, height: c_int) void {
+        const x: c_int = 12;
+        const width: c_int = @intCast(reader_layout.screen_width - 24);
+        const inset: c_int = 12;
+        const inner_width = width - 2;
+        const fill_width: c_int = if (!selected)
+            0
+        else if (is_reset and reset_hold_ms != 0)
+            @intCast((@as(u32, reset_hold_ms) * @as(u32, @intCast(inner_width))) / reader_coordinator.reset_hold_duration_ms)
+        else
+            inner_width;
+        const border_width: c_int = if (selected) 2 else 1;
+        const text_y = y + 2;
+        const label_x = x + inset;
+        const value_x = x + width - inset - self.uiTextWidth(value, selected);
+        const label_width = @max(@as(c_int, 0), value_x - label_x - 10);
+
+        self.playdate.graphics.setDrawMode(.DrawModeCopy);
+        self.playdate.graphics.fillRoundRect(x, y, width, height, 4, solidColor(self.backgroundColor()));
+        if (fill_width == inner_width) {
+            self.playdate.graphics.fillRoundRect(x + 1, y + 1, inner_width, height - 2, 3, solidColor(self.foregroundColor()));
+        } else if (fill_width > 0) {
+            self.playdate.graphics.fillRect(x + 1, y + 1, fill_width, height - 2, solidColor(self.foregroundColor()));
         }
-        self.text(if (view.selected == .reset_progress) "Hold A: reset   B: back" else "A: change   B: back", 12, 216);
+        self.playdate.graphics.drawRoundRect(x, y, width, height, 4, border_width, solidColor(self.foregroundColor()));
+        self.playdate.graphics.setDrawMode(self.textDrawMode());
+        self.drawLibraryLabel(label, label_x, text_y, selected, label_x, label_width, x, y, fill_width, height);
+        self.drawLibraryLabel(value, value_x, text_y, selected, value_x, self.uiTextWidth(value, selected), x, y, fill_width, height);
     }
 
     fn drawSettingsScrollbar(self: *Renderer, view: *const reader_coordinator.SettingsView) void {
-        self.drawRoundedScrollbar(394, 35, 4, 167, @intCast(view.first_visible), @intCast(view.row_count), @intCast(view.total_rows));
+        self.drawRoundedScrollbar(394, 43, 4, 163, @intCast(view.first_visible), @intCast(view.row_count), @intCast(view.total_rows));
     }
 
     fn drawRoundedScrollbar(self: *Renderer, track_x: c_int, track_y: c_int, track_width: c_int, track_height: c_int, first_visible: usize, visible_rows: usize, total_rows: usize) void {
