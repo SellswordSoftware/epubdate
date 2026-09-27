@@ -9,6 +9,9 @@ const reading_statistics = @import("../reading_statistics.zig");
 const progress_rail = @import("../progress_rail.zig");
 const page_transition = @import("../page_transition.zig");
 const screen_transition = @import("../screen_transition.zig");
+const library_transition = @import("../library_transition.zig");
+const word_spotlight = @import("../word_spotlight.zig");
+const highlight_collapse = @import("../highlight_collapse.zig");
 const TelemetrySnapshot = @import("../telemetry.zig").Telemetry.Snapshot;
 
 /// The only layer that translates reader drawing primitives into Playdate
@@ -33,12 +36,20 @@ pub const Renderer = struct {
     library_marquee_len: usize = 0,
     library_marquee_width: c_int = 0,
     library_marquee_frame: u16 = 0,
-    last_rendered_view: ?u64 = null,
     last_rendered_kind: ?RenderViewKind = null,
+    last_scroll_chapter_transition_nonce: u32 = 0,
     screen_transition_state: screen_transition.State = .{},
     screen_transition_source: ?*pdapi.LCDBitmap = null,
+    library_transition_state: library_transition.State = .{},
+    word_spotlight_state: word_spotlight.State = .{},
+    last_word_spotlight_nonce: u32 = 0,
+    highlight_collapse_state: highlight_collapse.State = .{},
+    last_highlight_dismiss_nonce: u32 = 0,
+    frame_now_ms: u32 = 0,
+    reduce_flashing: bool = false,
 
-    pub fn init(
+    pub fn initInPlace(
+        self: *Renderer,
         playdate: *pdapi.PlaydateAPI,
         ui_regular_font: *pdapi.LCDFont,
         ui_bold_font: *pdapi.LCDFont,
@@ -51,8 +62,8 @@ pub const Renderer = struct {
         roobert_11_bold_font: *pdapi.LCDFont,
         roobert_20_medium_font: *pdapi.LCDFont,
         roobert_24_medium_font: *pdapi.LCDFont,
-    ) Renderer {
-        return .{
+    ) void {
+        self.* = .{
             .playdate = playdate,
             .ui_regular_font = ui_regular_font,
             .ui_bold_font = ui_bold_font,
@@ -110,16 +121,33 @@ pub const Renderer = struct {
         return self.playdate.graphics.getFontHeight(self.readingFont(font));
     }
 
-    pub fn draw(self: *Renderer, model: reader_coordinator.RenderModel, allocator_stats: AllocatorStats, now_ms: u32, reduce_flashing: bool) void {
-        const view = renderViewId(model);
+    pub fn draw(self: *Renderer, model: *const reader_coordinator.RenderModel, allocator_stats: AllocatorStats, now_ms: u32, reduce_flashing: bool) void {
+        self.frame_now_ms = now_ms;
+        self.reduce_flashing = reduce_flashing;
+        if (reduce_flashing) {
+            self.word_spotlight_state.cancel();
+            self.highlight_collapse_state.cancel();
+        }
         const kind = renderViewKind(model);
+        const scroll_chapter_transition = switch (model.*) {
+            .scroll => |*view| blk: {
+                const changed = view.chapter_transition_nonce != 0 and view.chapter_transition_nonce != self.last_scroll_chapter_transition_nonce;
+                self.last_scroll_chapter_transition_nonce = view.chapter_transition_nonce;
+                break :blk changed;
+            },
+            else => false,
+        };
+        const entering_library = kind == .library and (self.last_rendered_kind == null or self.last_rendered_kind.? != .library);
+        if (reduce_flashing) self.library_transition_state.cancel() else if (entering_library) self.library_transition_state.begin(now_ms);
         if (reduce_flashing) {
             self.cancelScreenTransition();
-        } else if (self.last_rendered_view) |previous_view| {
-            if (previous_view != view and transitionsBetween(self.last_rendered_kind.?, kind)) self.beginScreenTransition(now_ms);
+        } else if (scroll_chapter_transition) {
+            self.beginScreenTransition(now_ms);
+        } else if (self.last_rendered_kind) |previous_kind| {
+            if (transitionsBetween(previous_kind, kind)) self.beginScreenTransition(now_ms);
         }
-        self.last_rendered_view = view;
         self.last_rendered_kind = kind;
+        const library_entrance_progress = self.library_transition_state.progress(now_ms);
 
         switch (self.screen_transition_state.phase(now_ms)) {
             .outgoing => |pattern| {
@@ -133,26 +161,26 @@ pub const Renderer = struct {
             },
             .background => return,
             .incoming => |pattern| {
-                self.drawModel(model, allocator_stats);
+                self.drawModel(model, allocator_stats, library_entrance_progress, now_ms);
                 self.applyDitherToFrame(pattern);
                 return;
             },
             .complete => self.cancelScreenTransition(),
         }
-        self.drawModel(model, allocator_stats);
+        self.drawModel(model, allocator_stats, library_entrance_progress, now_ms);
     }
 
-    fn drawModel(self: *Renderer, model: reader_coordinator.RenderModel, allocator_stats: AllocatorStats) void {
-        switch (model) {
-            .library => |view| self.drawLibrary(view),
-            .settings => |view| self.drawSettings(view),
-            .statistics => |view| self.drawStatistics(view),
-            .chapters => |view| self.drawChapters(view),
+    fn drawModel(self: *Renderer, model: *const reader_coordinator.RenderModel, allocator_stats: AllocatorStats, library_entrance_progress: u16, now_ms: u32) void {
+        switch (model.*) {
+            .library => |*view| self.drawLibrary(view, library_entrance_progress, now_ms),
+            .settings => |*view| self.drawSettings(view),
+            .statistics => |*view| self.drawStatistics(view),
+            .chapters => |*view| self.drawChapters(view),
             .opening => self.emphasizedText("Opening EPUB...", 12, 12),
-            .paged => |view| self.drawPage(view),
-            .scroll => |view| self.drawScroll(view),
-            .rsvp => |view| self.drawRsvp(view),
-            .failure => |view| self.drawFailure(view, allocator_stats),
+            .paged => |*view| self.drawPage(view),
+            .scroll => |*view| self.drawScroll(view),
+            .rsvp => |*view| self.drawRsvp(view),
+            .failure => |*view| self.drawFailure(view, allocator_stats),
         }
     }
 
@@ -299,14 +327,20 @@ pub const Renderer = struct {
         return if (self.theme == .dark) .DrawModeCopy else .DrawModeInverted;
     }
 
-    fn drawLibrary(self: *Renderer, view: reader_coordinator.LibraryView) void {
-        self.emphasizedText("Readr Library", 12, 12);
-        self.playdate.graphics.fillRect(0, 35, @intCast(reader_layout.screen_width), 1, solidColor(self.foregroundColor()));
+    fn drawLibrary(self: *Renderer, view: *const reader_coordinator.LibraryView, entrance_progress: u16, now_ms: u32) void {
+        const header_offset = entranceOffset(-40, entrance_progress);
+        const cards_offset = entranceOffset(-420, entrance_progress);
+        const scrollbar_offset = entranceOffset(18, entrance_progress);
         self.playdate.graphics.setDrawMode(.DrawModeCopy);
-        self.playdate.graphics.fillRect(0, 36, @intCast(reader_layout.screen_width), @intCast(reader_layout.screen_height - 36), self.libraryBodyPatternColor());
+        self.playdate.graphics.fillRect(0, 0, @intCast(reader_layout.screen_width), @intCast(reader_layout.screen_height), self.libraryBodyPatternColor());
+        // The opaque bar moves over the full-screen patterned backdrop rather
+        // than exposing an unpainted strip while it enters from above.
+        self.playdate.graphics.fillRect(0, header_offset, @intCast(reader_layout.screen_width), 36, solidColor(self.backgroundColor()));
         self.playdate.graphics.setDrawMode(self.textDrawMode());
+        self.emphasizedText("Readr Library", 12, 12 + header_offset);
+        self.playdate.graphics.fillRect(0, 35 + header_offset, @intCast(reader_layout.screen_width), 1, solidColor(self.foregroundColor()));
         if (view.count == 0) {
-            self.text("Put books in Data", 12, 45);
+            self.text("Put books in Data", 12 + cards_offset, 45);
             return;
         }
         const visible_rows = reader_coordinator.library_visible_rows;
@@ -314,13 +348,15 @@ pub const Renderer = struct {
         const end = @min(@as(usize, view.count), first + visible_rows);
         for (first..end) |index| {
             const y: c_int = 43 + @as(c_int, @intCast(index - first)) * 32;
-            self.drawLibraryItem(view.paths[index], view.progress[index], index == view.selected, y);
+            const delay = @as(u16, @intCast(index - first)) * library_transition.card_stagger_ms;
+            const card_offset = entranceOffset(-420, self.library_transition_state.staggeredProgress(now_ms, delay));
+            self.drawLibraryItem(view.paths[index], view.progress[index], index == view.selected, y, card_offset);
         }
-        self.drawRoundedScrollbar(394, 43, 4, 187, first, visible_rows, @intCast(view.count));
+        self.drawRoundedScrollbar(394 + scrollbar_offset, 43, 4, 187, first, visible_rows, @intCast(view.count));
     }
 
-    fn drawLibraryItem(self: *Renderer, title: []const u8, progress: ?u8, selected: bool, y: c_int) void {
-        const x: c_int = 12;
+    fn drawLibraryItem(self: *Renderer, title: []const u8, progress: ?u8, selected: bool, y: c_int, x_offset: c_int) void {
+        const x: c_int = 12 + x_offset;
         const width: c_int = @intCast(reader_layout.screen_width - 24);
         const height: c_int = 27;
         const inset: c_int = 12;
@@ -428,7 +464,7 @@ pub const Renderer = struct {
         return patternColor(if (self.theme == .dark) &library_body_pattern_dark else &library_body_pattern_light);
     }
 
-    fn drawSettings(self: *Renderer, view: reader_coordinator.SettingsView) void {
+    fn drawSettings(self: *Renderer, view: *const reader_coordinator.SettingsView) void {
         self.emphasizedText("Settings", 12, 12);
         const row_advance = @max(reader_layout.lineAdvance(self.uiFontHeight()), 24);
         for (0..view.row_count) |visible_index| {
@@ -475,7 +511,7 @@ pub const Renderer = struct {
         self.text(if (view.selected == .reset_progress) "Hold A: reset   B: back" else "A: change   B: back", 12, 216);
     }
 
-    fn drawSettingsScrollbar(self: *Renderer, view: reader_coordinator.SettingsView) void {
+    fn drawSettingsScrollbar(self: *Renderer, view: *const reader_coordinator.SettingsView) void {
         self.drawRoundedScrollbar(394, 35, 4, 167, @intCast(view.first_visible), @intCast(view.row_count), @intCast(view.total_rows));
     }
 
@@ -491,10 +527,10 @@ pub const Renderer = struct {
         self.playdate.graphics.fillRoundRect(track_x + 1, thumb_y, track_width - 2, thumb_height, 1, solidColor(self.foregroundColor()));
     }
 
-    fn drawStatistics(self: *Renderer, view: reader_coordinator.StatisticsView) void {
+    fn drawStatistics(self: *Renderer, view: *const reader_coordinator.StatisticsView) void {
         switch (view.backdrop) {
-            .paged => |backdrop| self.drawPage(backdrop),
-            .scroll => |backdrop| self.drawScroll(backdrop),
+            .paged => |*backdrop| self.drawPage(backdrop),
+            .scroll => |*backdrop| self.drawScroll(backdrop),
         }
 
         const sheet_x: c_int = 10;
@@ -527,7 +563,7 @@ pub const Renderer = struct {
         }
     }
 
-    fn drawChapters(self: *Renderer, view: reader_coordinator.ChaptersView) void {
+    fn drawChapters(self: *Renderer, view: *const reader_coordinator.ChaptersView) void {
         var header_buffer: [32]u8 = undefined;
         const header = std.fmt.bufPrint(&header_buffer, "Chapters {d}/{d}", .{ view.selected + 1, view.entries }) catch "Chapters";
         self.emphasizedText(header, 12, 12);
@@ -543,8 +579,12 @@ pub const Renderer = struct {
         self.text("B: back", 12, 220);
     }
 
-    fn drawPage(self: *Renderer, view: reader_coordinator.PagedView) void {
+    fn drawPage(self: *Renderer, view: *const reader_coordinator.PagedView) void {
         self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
+        if (view.restoring) {
+            self.text("Restoring position...", 12, 12);
+            return;
+        }
         if (view.line_count == 0) {
             self.text(if (view.reconstructing) "Restoring position..." else "Loading chapter...", 12, 12);
             return;
@@ -554,21 +594,87 @@ pub const Renderer = struct {
         const line_advance = reader_layout.lineAdvance(font_height);
         if (view.transition) |transition| {
             if (!self.screen_transition_state.active) {
-                self.drawPageTransition(view, transition, font, line_advance);
+                self.drawPageTransition(view, &transition, font, line_advance);
                 return;
             }
         }
         self.drawPageLines(&view.lines, view.line_count, font, line_advance, 0);
-        const span = view.selected_span orelse return;
+        if (view.selected_span) |span| {
+            const line = view.lines[span.line_index];
+            const x = reader_layout.text_x + @as(usize, @intCast(self.readingTextWidth(font, line[0..span.start])));
+            const y = reader_layout.text_y + @as(usize, span.line_index) * line_advance;
+            const word = line[span.start..span.end];
+            const rect = reader_layout.highlightRect(x, y, @intCast(self.readingTextWidth(font, word)), font_height);
+            self.invertedReadingText(font, word, @intCast(x), @intCast(y), @intCast(rect.x), @intCast(rect.y), @intCast(rect.width), @intCast(rect.height));
+            if (!self.reduce_flashing and view.spotlight_nonce != self.last_word_spotlight_nonce) {
+                self.last_word_spotlight_nonce = view.spotlight_nonce;
+                self.word_spotlight_state.begin(self.frame_now_ms);
+            }
+            self.drawWordSpotlight(rect);
+            self.highlight_collapse_state.cancel();
+            return;
+        }
+        self.word_spotlight_state.cancel();
+        if (view.dismiss_span) |span| self.drawHighlightCollapse(view, span, font, font_height, line_advance) else self.highlight_collapse_state.cancel();
+    }
+
+    fn drawHighlightCollapse(self: *Renderer, view: *const reader_coordinator.PagedView, span: pagination.PageCache.WordSpan, font: reader_coordinator.ReadingFont, font_height: usize, line_advance: usize) void {
+        if (!self.reduce_flashing and view.dismiss_nonce != self.last_highlight_dismiss_nonce) {
+            self.last_highlight_dismiss_nonce = view.dismiss_nonce;
+            self.highlight_collapse_state.begin(self.frame_now_ms);
+        }
+        const remaining = self.highlight_collapse_state.remaining(self.frame_now_ms) orelse return;
         const line = view.lines[span.line_index];
         const x = reader_layout.text_x + @as(usize, @intCast(self.readingTextWidth(font, line[0..span.start])));
         const y = reader_layout.text_y + @as(usize, span.line_index) * line_advance;
         const word = line[span.start..span.end];
         const rect = reader_layout.highlightRect(x, y, @intCast(self.readingTextWidth(font, word)), font_height);
+        const height = highlight_collapse.height(@intCast(rect.height), remaining);
+        if (height == 0) return;
+        const collapse_y: c_int = @intCast(rect.y + (rect.height - @as(usize, @intCast(height))) / 2);
+        self.playdate.graphics.setClipRect(@intCast(rect.x), collapse_y, @intCast(rect.width), height);
         self.invertedReadingText(font, word, @intCast(x), @intCast(y), @intCast(rect.x), @intCast(rect.y), @intCast(rect.width), @intCast(rect.height));
+        self.playdate.graphics.clearClipRect();
     }
 
-    fn drawPageTransition(self: *Renderer, view: reader_coordinator.PagedView, transition: reader_coordinator.PageTransitionView, font: reader_coordinator.ReadingFont, line_advance: usize) void {
+    fn drawWordSpotlight(self: *Renderer, target: reader_layout.HighlightRect) void {
+        const progress = self.word_spotlight_state.progress(self.frame_now_ms) orelse return;
+        const finish: c_int = @intCast(@max(target.width, target.height) + 4);
+        // This safely covers every screen corner even when the selected word
+        // lies near an edge. A sparse Bayer mask paints only 25% of the dots
+        // in the active foreground color, leaving the page legible beneath.
+        const diameter = word_spotlight.diameter(@intCast(reader_layout.screen_width * 3), finish, progress);
+        const center_x: c_int = @intCast(target.x + target.width / 2);
+        const center_y: c_int = @intCast(target.y + target.height / 2);
+        self.drawForegroundDitheredCircle(center_x, center_y, diameter);
+    }
+
+    fn drawForegroundDitheredCircle(self: *Renderer, center_x: c_int, center_y: c_int, diameter: c_int) void {
+        const radius = @divTrunc(diameter, 2);
+        const radius_squared: i64 = @as(i64, radius) * radius;
+        const first_y: c_int = @max(0, center_y - radius);
+        const last_y: c_int = @min(@as(c_int, @intCast(reader_layout.screen_height - 1)), center_y + radius);
+        const first_x: c_int = @max(0, center_x - radius);
+        const last_x: c_int = @min(@as(c_int, @intCast(reader_layout.screen_width - 1)), center_x + radius);
+        const frame = self.playdate.graphics.getFrame();
+        const foreground: u8 = if (self.theme == .dark) 0xff else 0x00;
+        var y = first_y;
+        while (y <= last_y) : (y += 1) {
+            const dy: i64 = @as(i64, y - center_y);
+            const pattern_row = spotlight_foreground_dither_25[@intCast(y & 3)];
+            var x = first_x;
+            while (x <= last_x) : (x += 1) {
+                const dx: i64 = @as(i64, x - center_x);
+                if (dx * dx + dy * dy > radius_squared) continue;
+                const bit: u8 = @as(u8, 0x80) >> @intCast(x & 7);
+                if (pattern_row & bit == 0) continue;
+                const offset = @as(usize, @intCast(y)) * pdapi.LCD_ROWSIZE + @as(usize, @intCast(x)) / 8;
+                if (foreground & bit == 0) frame[offset] &= ~bit else frame[offset] |= bit;
+            }
+        }
+    }
+
+    fn drawPageTransition(self: *Renderer, view: *const reader_coordinator.PagedView, transition: *const reader_coordinator.PageTransitionView, font: reader_coordinator.ReadingFont, line_advance: usize) void {
         const screen_width: c_int = @intCast(reader_layout.screen_width);
         const band_height: c_int = @intCast(reader_layout.screen_height / page_transition.band_count);
         for (0..page_transition.band_count) |band_index| {
@@ -597,9 +703,13 @@ pub const Renderer = struct {
         }
     }
 
-    fn drawRsvp(self: *Renderer, view: reader_coordinator.RsvpView) void {
+    fn drawRsvp(self: *Renderer, view: *const reader_coordinator.RsvpView) void {
         self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
         self.text(if (view.playing) "RSVP - playing" else "RSVP - paused", 12, 12);
+        if (view.manual_wpm) |wpm| {
+            var live_wpm_buffer: [24]u8 = undefined;
+            self.rightAlignedUiText(std.fmt.bufPrint(&live_wpm_buffer, "Live: {d} WPM", .{wpm}) catch "", 12, false);
+        }
         var buffer: [16]u8 = undefined;
         self.text(std.fmt.bufPrint(&buffer, "WPM: {d}", .{view.wpm}) catch "", 12, 36);
         const word = view.word orelse {
@@ -622,7 +732,7 @@ pub const Renderer = struct {
         self.text("Left: prev sentence  B: back", 12, 216);
     }
 
-    fn drawScroll(self: *Renderer, view: reader_coordinator.ScrollView) void {
+    fn drawScroll(self: *Renderer, view: *const reader_coordinator.ScrollView) void {
         self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
         if (view.restoring) {
             self.text("Restoring position...", 12, 12);
@@ -634,20 +744,25 @@ pub const Renderer = struct {
         const font = self.pages_font;
         const font_height = self.readingFontHeight(font);
         const advance: i32 = @intCast(reader_layout.lineAdvance(font_height));
+        // Moving forward lifts the chapter; moving backward at its start
+        // lowers it and reveals the continuation affordance above.
+        const overscroll: i32 = @as(i32, @intCast(view.chapter_end_overscroll_px)) - @as(i32, @intCast(view.chapter_start_overscroll_px));
         for (view.window.tiles[0..view.window.tile_count]) |tile| switch (tile) {
             .page => |page| {
                 for (0..page.cache.line_count) |line_index| {
-                    const y: i32 = @as(i32, page.origin_y) + @as(i32, @intCast(line_index)) * advance;
+                    const y: i32 = @as(i32, page.origin_y) + @as(i32, @intCast(line_index)) * advance - overscroll;
                     self.readingText(font, page.cache.line(line_index), @intCast(reader_layout.text_x), @intCast(y));
                 }
             },
             .loading_before, .loading_after, .unavailable_before, .unavailable_after => |origin_y| {
                 const last_y: i32 = @intCast(reader_layout.screen_height - reader_layout.reserved_edge_rows - font_height);
-                const y = std.math.clamp(@as(i32, origin_y), @as(i32, reader_layout.text_y), last_y);
+                const y = std.math.clamp(@as(i32, origin_y) - overscroll, @as(i32, reader_layout.text_y), last_y);
                 self.text("...", @intCast(reader_layout.text_x), @intCast(y));
             },
         };
         self.playdate.graphics.setClipRect(0, 0, @intCast(reader_layout.screen_width), @intCast(reader_layout.screen_height));
+        if (view.chapter_start_overscroll_px >= 24) self.text("Keep turning to go back", 120, 12);
+        if (view.chapter_end_overscroll_px >= 24) self.text("Keep turning to continue", 112, 216);
     }
 
     fn drawProgressRails(
@@ -671,8 +786,8 @@ pub const Renderer = struct {
         self.playdate.graphics.drawLine(@intCast(x1), @intCast(y1), @intCast(x2), @intCast(y2), 1, solidColor(self.foregroundColor()));
     }
 
-    fn drawFailure(self: *Renderer, view: reader_coordinator.ErrorView, allocator_stats: AllocatorStats) void {
-        switch (view) {
+    fn drawFailure(self: *Renderer, view: *const reader_coordinator.ErrorView, allocator_stats: AllocatorStats) void {
+        switch (view.*) {
             .unavailable => self.emphasizedText("EPUB unavailable", 12, 12),
             .invalid_archive => |detail| self.drawOpeningFailure(detail, allocator_stats),
             .missing_mimetype => self.emphasizedText("mimetype entry missing", 12, 12),
@@ -690,7 +805,7 @@ pub const Renderer = struct {
                 self.text("Left/Right: another chapter", 12, 100);
             },
         }
-        if (view != .chapter) self.text("B: library", 12, 216);
+        if (view.* != .chapter) self.text("B: library", 12, 216);
     }
 
     fn drawOpeningFailure(self: *Renderer, detail: reader_coordinator.OpeningFailure, allocator_stats: AllocatorStats) void {
@@ -801,22 +916,16 @@ const library_body_pattern_dark = pdapi.LCDPattern{
     0xff,
 };
 
+/// 4×4 Bayer threshold cells below 25%, repeated across an LCD byte.
+const spotlight_foreground_dither_25 = [4]u8{
+    0b10101010,
+    0b00000000,
+    0b10101010,
+    0b00000000,
+};
+
 fn patternColor(pattern: *const pdapi.LCDPattern) pdapi.LCDColor {
     return @intFromPtr(pattern);
-}
-
-fn renderViewId(model: reader_coordinator.RenderModel) u64 {
-    return switch (model) {
-        .library => 1,
-        .opening => 2,
-        .paged => |view| @as(u64, 0x10_0000_0000) | @as(u64, view.page_index),
-        .scroll => 4,
-        .rsvp => 5,
-        .settings => 6,
-        .statistics => 7,
-        .chapters => 8,
-        .failure => 9,
-    };
 }
 
 const RenderViewKind = enum {
@@ -831,8 +940,8 @@ const RenderViewKind = enum {
     failure,
 };
 
-fn renderViewKind(model: reader_coordinator.RenderModel) RenderViewKind {
-    return switch (model) {
+fn renderViewKind(model: *const reader_coordinator.RenderModel) RenderViewKind {
+    return switch (model.*) {
         .library => .library,
         .opening => .opening,
         .paged => .paged,
@@ -860,6 +969,10 @@ fn isReadingView(view: RenderViewKind) bool {
 
 fn isPagedView(view: RenderViewKind) bool {
     return view == .paged or view == .scroll;
+}
+
+fn entranceOffset(start: c_int, progress: u16) c_int {
+    return @intCast(@divTrunc(@as(i32, start) * @as(i32, library_transition.complete - progress), library_transition.complete));
 }
 
 test "screen fade only covers the selected navigation boundaries" {

@@ -15,6 +15,9 @@ pub const App = struct {
     allocator: *PlaydateAllocator,
     renderer: PlaydateRenderer,
     coordinator: reader_coordinator.ReaderCoordinator,
+    // Kept with the heap-allocated app so the per-frame callback never needs
+    // to construct a RenderModel on its small device stack.
+    render_model: reader_coordinator.RenderModel = .opening,
     opening_file: ?PlaydateFileReader = null,
     // Chapter source is never collected: this file and stream stay open while
     // a current/next pair of drawable pages is built incrementally.
@@ -44,7 +47,7 @@ pub const App = struct {
         const app = try allocator.allocator().create(App);
         app.playdate = playdate;
         app.allocator = allocator;
-        app.renderer = PlaydateRenderer.init(
+        app.renderer.initInPlace(
             playdate,
             newsleak_serif_font,
             newsleak_serif_bold_font,
@@ -58,6 +61,7 @@ pub const App = struct {
             roobert_20_medium_font,
             roobert_24_medium_font,
         );
+        app.render_model = .opening;
         app.opening_file = null;
         app.chapter_file = null;
         app.prefetch_file = null;
@@ -95,7 +99,8 @@ pub const App = struct {
         self.syncSystemMenu();
 
         self.renderer.beginFrame(self.coordinator.theme, self.coordinator.pages_font, self.coordinator.rsvp_font);
-        self.renderer.draw(self.coordinator.renderModel(), self.allocator.stats, started_at, self.coordinator.reduceFlashing());
+        self.coordinator.renderModelInto(&self.render_model);
+        self.renderer.draw(&self.render_model, self.allocator.stats, started_at, self.coordinator.reduceFlashing());
         if (self.coordinator.telemetrySnapshot()) |snapshot| self.renderer.drawTelemetry(snapshot, self.allocator.stats);
         return 1;
     }
