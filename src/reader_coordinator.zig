@@ -36,6 +36,12 @@ const word_semantics_revision: u16 = 1;
 const crank_degrees_per_word: f32 = 15;
 const scroll_millidegrees_per_pixel: i32 = 1_250;
 const scroll_chapter_transition_threshold_px: u16 = reader_layout.screen_height / 2;
+/// RSVP can move far ahead of the last laid-out page. On the return trip the
+/// restoring view is already intentionally blank, so spend a little more of
+/// that frame budget reconstructing the requested page rather than revealing
+/// intermediate pages one at a time.
+const rsvp_return_reconstruction_bytes_per_update: usize = 6 * 1024;
+const rsvp_return_page_completions_per_update: u8 = 3;
 pub const reset_hold_duration_ms: u16 = 3000;
 pub const default_checkpoint_byte_budget = cache_policy.capacity * @sizeOf(cache_policy.Entry);
 pub const page_pool_reserved_bytes = paged_reader.PagedReader.page_pool_reserved_bytes;
@@ -242,6 +248,9 @@ pub const ReaderCoordinator = struct {
     page_transition_state: page_transition.State = .{},
     restore_transition_pending: bool = false,
     scroll_restore_pending: ?ScrollRestoreTarget = null,
+    /// Set only for RSVP -> Pages/Scroll restoration. It is deliberately not
+    /// used by ordinary saved-position or chapter reconstruction.
+    rsvp_return_fast_restore: bool = false,
     word_spotlight_nonce: u32 = 0,
     word_highlight_dismiss_nonce: u32 = 0,
     frame_now_ms: u32 = 0,
@@ -315,6 +324,7 @@ pub const ReaderCoordinator = struct {
         self.page_transition_state = .{};
         self.restore_transition_pending = false;
         self.scroll_restore_pending = null;
+        self.rsvp_return_fast_restore = false;
         self.word_spotlight_nonce = 0;
         self.word_highlight_dismiss_nonce = 0;
         self.frame_now_ms = 0;
@@ -568,6 +578,7 @@ pub const ReaderCoordinator = struct {
         self.page_transition_state.cancel();
         self.restore_transition_pending = false;
         self.scroll_restore_pending = null;
+        self.rsvp_return_fast_restore = false;
         self.clearResetHold();
         self.returnToLibrary();
         self.lifecycle = .opening;
@@ -1023,6 +1034,7 @@ pub const ReaderCoordinator = struct {
         self.cancelChapter();
         self.scroll_chapter_end_overscroll_px = 0;
         self.scroll_chapter_start_overscroll_px = 0;
+        self.rsvp_return_fast_restore = false;
         self.chapter_open = .{ .index = index, .action = action };
         self.scroll_align_chapter_end = self.mode == .paged and self.paged_presentation == .scroll and action == .rescan_to_last_page;
         if (action != .scroll_rescan) {
@@ -1109,6 +1121,7 @@ pub const ReaderCoordinator = struct {
 
         const reconstructing = self.chapterIsReconstructing();
         var budget = self.chapterWorkBudget();
+        var completed_pages: u8 = 0;
         while (budget != 0 and !self.paged.next_ready and !self.chapter_end) {
             if (self.chapter_output_start != self.chapter_output_end) {
                 const available = self.chapter_output[self.chapter_output_start..self.chapter_output_end];
@@ -1128,7 +1141,10 @@ pub const ReaderCoordinator = struct {
                 };
                 self.chapter_output_start += consumed;
                 budget -= consumed;
-                if (reconstructing and page_completed) return .{ .worked = true };
+                if (page_completed) {
+                    completed_pages += 1;
+                    if (reconstructing and (!self.isFastRsvpReturnRestore() or completed_pages >= rsvp_return_page_completions_per_update)) return .{ .worked = true };
+                }
                 if (self.mode == .rsvp and self.rsvp_reader.hasWord()) {
                     self.telemetry.setChapterEvents(self.rsvp_reader.event_count);
                     if (self.pending_mode_word_ordinal == self.rsvp_reader.position().word) self.pending_mode_word_ordinal = null;
@@ -1227,7 +1243,12 @@ pub const ReaderCoordinator = struct {
     }
 
     fn chapterWorkBudget(self: *const ReaderCoordinator) usize {
+        if (self.isFastRsvpReturnRestore()) return rsvp_return_reconstruction_bytes_per_update;
         return if (self.chapterIsReconstructing()) limits.reconstruction_bytes_per_update else limits.forward_chapter_bytes_per_update;
+    }
+
+    fn isFastRsvpReturnRestore(self: *const ReaderCoordinator) bool {
+        return self.rsvp_return_fast_restore and self.mode == .paged and self.paged.isReconstructing();
     }
 
     fn pageCompleted(self: *ReaderCoordinator, now_ms: u32) void {
@@ -1803,6 +1824,7 @@ pub const ReaderCoordinator = struct {
     }
 
     fn switchReadingMode(self: *ReaderCoordinator, now_ms: u32) void {
+        const returning_from_rsvp = self.mode == .rsvp;
         const target_word = if (self.mode == .paged)
             reader_transitions.pagedModeSwitchOrdinal(self.currentPagedWordOrdinal(), self.paged.pending_selection)
         else
@@ -1830,6 +1852,7 @@ pub const ReaderCoordinator = struct {
                     self.scroll_restore_pending = if (self.paged_presentation == .scroll) .{ .word = target_word } else null;
                     self.paged.pending_selection = .{ .ordinal = target_word };
                     self.openChapter(self.chapter_index, .{ .word_rescan = target_word });
+                    self.rsvp_return_fast_restore = returning_from_rsvp;
                 },
                 .rsvp => self.openChapter(self.chapter_index, .{ .rsvp_rescan = .{ .word = target_word } }),
             }
@@ -2145,6 +2168,7 @@ pub const ReaderCoordinator = struct {
         if (self.mode != .paged or !self.paged.current_ready) return;
         if (!self.paged.fulfillPendingSelection()) return;
         if (self.pending_mode_word_ordinal == self.paged.selected_word_ordinal) self.pending_mode_word_ordinal = null;
+        self.rsvp_return_fast_restore = false;
         if (self.paged_presentation == .scroll) self.paged.beginScrollAtWord(self.paged.selected_word_ordinal orelse self.currentPagedWordOrdinal(), self.scrollGeometry());
         self.requestPositionSave();
     }
@@ -3174,6 +3198,9 @@ test "coordinator raises only semantic reconstruction work to the reconstruction
 
     coordinator.paged.beginWordRescan(12);
     try std.testing.expectEqual(limits.reconstruction_bytes_per_update, coordinator.chapterWorkBudget());
+
+    coordinator.rsvp_return_fast_restore = true;
+    try std.testing.expectEqual(rsvp_return_reconstruction_bytes_per_update, coordinator.chapterWorkBudget());
 
     coordinator.mode = .rsvp;
     coordinator.rsvp_reader.reconstruct(.{ .word = 12 });
