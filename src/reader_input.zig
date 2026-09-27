@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Screen = enum { library, opening, reading, settings, statistics, chapter_browser };
+pub const Screen = enum { library, book_actions, opening, reading, settings, statistics, chapter_browser };
 pub const Readiness = enum { opening, ready, opening_failure, chapter_error };
 pub const ReadingMode = enum { paged, rsvp };
 pub const PagedPresentation = enum { pages, scroll };
@@ -27,6 +27,10 @@ pub const Intent = enum {
     library_next,
     library_previous,
     open_selected_book,
+    close_book_actions,
+    book_action_next,
+    book_action_previous,
+    activate_book_action,
     return_to_library,
     open_settings,
     open_statistics,
@@ -67,6 +71,13 @@ pub fn intentFor(snapshot: Snapshot) Intent {
         if (snapshot.buttons.a) return .open_browser_chapter;
         if (snapshot.buttons.down or snapshot.buttons.right) return .chapter_browser_next;
         if (snapshot.buttons.up or snapshot.buttons.left) return .chapter_browser_previous;
+        return .none;
+    }
+    if (snapshot.screen == .book_actions) {
+        if (snapshot.buttons.b) return .close_book_actions;
+        if (snapshot.buttons.a) return .activate_book_action;
+        if (snapshot.buttons.down or snapshot.buttons.right) return .book_action_next;
+        if (snapshot.buttons.up or snapshot.buttons.left) return .book_action_previous;
         return .none;
     }
     if (snapshot.screen == .reading) {
@@ -163,6 +174,18 @@ test "settings consumes its own controls before reader navigation" {
 test "screen and reader state route the remaining navigation intents" {
     try std.testing.expectEqual(Intent.open_selected_book, intentFor(.{
         .screen = .library,
+        .readiness = .opening,
+        .mode = .paged,
+        .buttons = .{ .a = true },
+    }));
+    try std.testing.expectEqual(Intent.book_action_next, intentFor(.{
+        .screen = .book_actions,
+        .readiness = .opening,
+        .mode = .paged,
+        .buttons = .{ .down = true },
+    }));
+    try std.testing.expectEqual(Intent.activate_book_action, intentFor(.{
+        .screen = .book_actions,
         .readiness = .opening,
         .mode = .paged,
         .buttons = .{ .a = true },

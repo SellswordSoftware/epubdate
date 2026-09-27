@@ -28,9 +28,7 @@ pub const App = struct {
     // Progress indexing owns an independent stream and decoder workspace.
     progress_file: ?PlaydateFileReader = null,
     telemetry_menu: ?*pdapi.PDMenuItem = null,
-    chapters_menu: ?*pdapi.PDMenuItem = null,
     settings_menu: ?*pdapi.PDMenuItem = null,
-    chapters_menu_visible: bool = false,
 
     pub fn init(playdate: *pdapi.PlaydateAPI, allocator: *PlaydateAllocator) !*App {
         const newsleak_serif_font = playdate.graphics.loadFont("assets/fonts/Newsleak-Serif.pft", null) orelse return error.FontLoadFailed;
@@ -67,9 +65,7 @@ pub const App = struct {
         app.prefetch_file = null;
         app.progress_file = null;
         app.telemetry_menu = null;
-        app.chapters_menu = null;
         app.settings_menu = null;
-        app.chapters_menu_visible = false;
         app.coordinator.initInPlace(reader_coordinator.default_checkpoint_byte_budget);
         app.coordinator.attachAllocator(allocator.allocator());
         app.coordinator.attachPersistence(persistence.Service.init(playdate_persistence.fileStore(playdate.file)));
@@ -96,7 +92,6 @@ pub const App = struct {
             .crank_docked = self.playdate.system.isCrankDocked() != 0,
             .reduce_flashing = self.playdate.system.getReduceFlashing() != 0,
         }, started_at);
-        self.syncSystemMenu();
 
         self.renderer.beginFrame(self.coordinator.theme, self.coordinator.pages_font, self.coordinator.rsvp_font);
         self.coordinator.renderModelInto(&self.render_model);
@@ -135,21 +130,6 @@ pub const App = struct {
         // Retain telemetry wiring for later diagnostics without exposing it
         // in the current player-facing system menu.
         // self.telemetry_menu = self.playdate.system.addCheckmarkMenuItem("Telemetry", 0, telemetryMenuSelected, self);
-    }
-
-    fn syncSystemMenu(self: *App) void {
-        const chapters_visible = self.coordinator.chaptersMenuAvailable();
-        if (chapters_visible == self.chapters_menu_visible) return;
-        self.chapters_menu_visible = chapters_visible;
-
-        if (chapters_visible) {
-            self.playdate.system.removeMenuItem(self.settings_menu);
-            self.chapters_menu = self.playdate.system.addMenuItem("Chapters", chaptersMenuSelected, self);
-            self.settings_menu = self.playdate.system.addMenuItem("Settings", settingsMenuSelected, self);
-        } else {
-            self.playdate.system.removeMenuItem(self.chapters_menu);
-            self.chapters_menu = null;
-        }
     }
 
     fn closeOpeningFile(self: *App) void {
@@ -244,11 +224,6 @@ fn telemetryMenuSelected(userdata: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(userdata orelse return));
     const item = app.telemetry_menu orelse return;
     app.coordinator.setTelemetryEnabled(app.playdate.system.getMenuItemValue(item) != 0);
-}
-
-fn chaptersMenuSelected(userdata: ?*anyopaque) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(userdata orelse return));
-    app.coordinator.handleSystemAction(.chapters, app.playdate.system.getCurrentTimeMilliseconds());
 }
 
 fn collectLibraryPath(path: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {

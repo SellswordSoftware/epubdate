@@ -10,12 +10,13 @@ pub fn fileStore(file_api: *const pdapi.PlaydateFile) persistence.FileStore {
         .read = read,
         .write = write,
         .delete = delete,
+        .ensure_directory = ensureDirectory,
     };
 }
 
 fn read(context: *anyopaque, name: []const u8, output: []u8) bool {
     const file_api: *const pdapi.PlaydateFile = @ptrCast(@alignCast(context));
-    var filename_buffer: [32]u8 = undefined;
+    var filename_buffer: [96]u8 = undefined;
     const filename = std.fmt.bufPrintZ(&filename_buffer, "{s}", .{name}) catch return false;
     const file = file_api.open(filename.ptr, pdapi.FILE_READ | pdapi.FILE_READ_DATA) orelse return false;
     defer _ = file_api.close(file);
@@ -24,7 +25,7 @@ fn read(context: *anyopaque, name: []const u8, output: []u8) bool {
 
 fn write(context: *anyopaque, name: []const u8, input: []const u8) bool {
     const file_api: *const pdapi.PlaydateFile = @ptrCast(@alignCast(context));
-    var filename_buffer: [32]u8 = undefined;
+    var filename_buffer: [96]u8 = undefined;
     const filename = std.fmt.bufPrintZ(&filename_buffer, "{s}", .{name}) catch return false;
     const file = file_api.open(filename.ptr, pdapi.FILE_WRITE) orelse return false;
     defer _ = file_api.close(file);
@@ -34,7 +35,16 @@ fn write(context: *anyopaque, name: []const u8, input: []const u8) bool {
 
 fn delete(context: *anyopaque, name: []const u8) bool {
     const file_api: *const pdapi.PlaydateFile = @ptrCast(@alignCast(context));
-    var filename_buffer: [32]u8 = undefined;
+    var filename_buffer: [96]u8 = undefined;
     const filename = std.fmt.bufPrintZ(&filename_buffer, "{s}", .{name}) catch return false;
     return file_api.unlink(filename.ptr, 0) == 0;
+}
+
+fn ensureDirectory(context: *anyopaque, name: []const u8) bool {
+    const file_api: *const pdapi.PlaydateFile = @ptrCast(@alignCast(context));
+    var filename_buffer: [96]u8 = undefined;
+    const filename = std.fmt.bufPrintZ(&filename_buffer, "{s}", .{name}) catch return false;
+    var stat: pdapi.FileStat = undefined;
+    if (file_api.stat(filename.ptr, &stat) == 0) return stat.isdir != 0;
+    return file_api.mkdir(filename.ptr) == 0;
 }

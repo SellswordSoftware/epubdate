@@ -137,7 +137,7 @@ pub const Renderer = struct {
             },
             else => false,
         };
-        const entering_library = kind == .library and (self.last_rendered_kind == null or self.last_rendered_kind.? != .library);
+        const entering_library = entersLibrary(kind, self.last_rendered_kind);
         if (reduce_flashing) self.library_transition_state.cancel() else if (entering_library) self.library_transition_state.begin(now_ms);
         if (reduce_flashing) {
             self.cancelScreenTransition();
@@ -173,6 +173,7 @@ pub const Renderer = struct {
     fn drawModel(self: *Renderer, model: *const reader_coordinator.RenderModel, allocator_stats: AllocatorStats, library_entrance_progress: u16, now_ms: u32) void {
         switch (model.*) {
             .library => |*view| self.drawLibrary(view, library_entrance_progress, now_ms),
+            .book_actions => |*view| self.drawBookActions(view, library_entrance_progress, now_ms),
             .settings => |*view| self.drawSettings(view),
             .statistics => |*view| self.drawStatistics(view),
             .chapters => |*view| self.drawChapters(view),
@@ -405,6 +406,37 @@ pub const Renderer = struct {
             self.drawLibraryItem(view.paths[index], view.progress[index], index == view.selected, y, card_offset);
         }
         self.drawRoundedScrollbar(394 + scrollbar_offset, 43, 4, 187, first, visible_rows, @intCast(view.count));
+    }
+
+    fn drawBookActions(self: *Renderer, view: *const reader_coordinator.BookActionsView, library_entrance_progress: u16, now_ms: u32) void {
+        self.drawLibrary(&view.library, library_entrance_progress, now_ms);
+        const sheet_x: c_int = 64;
+        const sheet_y: c_int = 58;
+        const sheet_width: c_int = 272;
+        const sheet_height: c_int = 126;
+        var title_buffer: [128]u8 = undefined;
+        const title = self.truncatedLibraryTitle(view.title, 220, true, &title_buffer);
+
+        self.playdate.graphics.setDrawMode(.DrawModeCopy);
+        self.playdate.graphics.fillRoundRect(sheet_x, sheet_y, sheet_width, sheet_height, 8, solidColor(self.backgroundColor()));
+        self.playdate.graphics.drawRoundRect(sheet_x, sheet_y, sheet_width, sheet_height, 8, 2, solidColor(self.foregroundColor()));
+        self.playdate.graphics.setDrawMode(self.textDrawMode());
+        self.centeredUiText(title, sheet_y + 13, true);
+        self.drawBookActionItem(if (view.has_resume) "Resume reading" else "Start reading", sheet_y + 42, view.selected == .start_or_resume);
+        self.drawBookActionItem("Choose chapter", sheet_y + 72, view.selected == .chapters);
+        self.centeredUiText("A: select     B: cancel", sheet_y + 103, false);
+    }
+
+    fn drawBookActionItem(self: *Renderer, label: []const u8, y: c_int, selected: bool) void {
+        const x: c_int = 84;
+        const width: c_int = 232;
+        const height: c_int = 24;
+        self.playdate.graphics.setDrawMode(.DrawModeCopy);
+        self.playdate.graphics.fillRoundRect(x, y, width, height, 4, solidColor(if (selected) self.foregroundColor() else self.backgroundColor()));
+        self.playdate.graphics.drawRoundRect(x, y, width, height, 4, if (selected) 2 else 1, solidColor(self.foregroundColor()));
+        self.playdate.graphics.setDrawMode(if (selected) self.filledTextDrawMode() else self.textDrawMode());
+        self.centeredUiText(label, y + 2, selected);
+        self.playdate.graphics.setDrawMode(self.textDrawMode());
     }
 
     fn drawLibraryItem(self: *Renderer, title: []const u8, progress: ?u8, selected: bool, y: c_int, x_offset: c_int) void {
@@ -1104,6 +1136,7 @@ fn patternColor(pattern: *const pdapi.LCDPattern) pdapi.LCDColor {
 
 const RenderViewKind = enum {
     library,
+    book_actions,
     opening,
     paged,
     scroll,
@@ -1117,6 +1150,7 @@ const RenderViewKind = enum {
 fn renderViewKind(model: *const reader_coordinator.RenderModel) RenderViewKind {
     return switch (model.*) {
         .library => .library,
+        .book_actions => .book_actions,
         .opening => .opening,
         .paged => .paged,
         .scroll => .scroll,
@@ -1135,6 +1169,14 @@ fn transitionsBetween(previous: RenderViewKind, next: RenderViewKind) bool {
     }
     if (previous == .library or next == .library) return isReadingView(if (previous == .library) next else previous);
     return (previous == .rsvp and isPagedView(next)) or (next == .rsvp and isPagedView(previous));
+}
+
+fn entersLibrary(next: RenderViewKind, previous: ?RenderViewKind) bool {
+    if (next != .library) return false;
+    const prior = previous orelse return true;
+    // The book action sheet is drawn over the existing Library frame, so
+    // dismissing it should restore that frame, not replay its entrance.
+    return prior != .library and prior != .book_actions;
 }
 
 fn isReadingView(view: RenderViewKind) bool {
@@ -1159,6 +1201,11 @@ test "screen fade only covers the selected navigation boundaries" {
     try std.testing.expect(!transitionsBetween(.opening, .paged));
     try std.testing.expect(!transitionsBetween(.paged, .statistics));
     try std.testing.expect(!transitionsBetween(.chapters, .paged));
+}
+
+test "dismissing book actions does not re-enter the library" {
+    try std.testing.expect(!entersLibrary(.library, .book_actions));
+    try std.testing.expect(entersLibrary(.library, .opening));
 }
 
 fn nextUtf8Boundary(value: []const u8, start: usize, limit: usize) usize {

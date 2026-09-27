@@ -13,8 +13,8 @@ pub const row_count: u4 = 8;
 pub const global_row_count: u4 = @intFromEnum(Row.reset_progress);
 pub const visible_capacity: u4 = 7;
 
-test "Progression is the first settings row" {
-    try @import("std").testing.expectEqual(@as(u4, 0), @intFromEnum(Row.paged_presentation));
+test "Theme is the first settings row" {
+    try @import("std").testing.expectEqual(@as(u4, 0), @intFromEnum(Row.theme));
     try @import("std").testing.expectEqual(@as(u4, 8), row_count);
 }
 
