@@ -176,7 +176,7 @@ pub const Renderer = struct {
             .settings => |*view| self.drawSettings(view),
             .statistics => |*view| self.drawStatistics(view),
             .chapters => |*view| self.drawChapters(view),
-            .opening => self.emphasizedText("Opening EPUB...", 12, 12),
+            .opening => self.drawLoadingScene("Opening book", "Preparing EPUB"),
             .paged => |*view| self.drawPage(view),
             .scroll => |*view| self.drawScroll(view),
             .rsvp => |*view| self.drawRsvp(view),
@@ -298,6 +298,58 @@ pub const Renderer = struct {
     fn rightAlignedUiText(self: *Renderer, value: []const u8, y: c_int, bold: bool) void {
         const x = @max(@as(c_int, 24), @as(c_int, @intCast(reader_layout.screen_width)) - 12 - self.uiTextWidth(value, bold));
         if (bold) self.emphasizedText(value, x, y) else self.text(value, x, y);
+    }
+
+    fn centeredUiText(self: *Renderer, value: []const u8, y: c_int, bold: bool) void {
+        const screen_width: c_int = @intCast(reader_layout.screen_width);
+        const x = @divTrunc(screen_width - self.uiTextWidth(value, bold), 2);
+        if (bold) self.emphasizedText(value, x, y) else self.text(value, x, y);
+    }
+
+    /// A deliberately indeterminate loading scene. EPUB work has several
+    /// phases without one honest global percentage, so the travelling dither
+    /// segment signals activity without inventing progress.
+    fn drawLoadingScene(self: *Renderer, title: []const u8, detail: []const u8) void {
+        const screen_width: c_int = @intCast(reader_layout.screen_width);
+        const screen_height: c_int = @intCast(reader_layout.screen_height);
+        const card_x: c_int = 40;
+        const card_y: c_int = 49;
+        const card_width: c_int = screen_width - card_x * 2;
+        const card_height: c_int = 142;
+        const rail_x: c_int = card_x + 43;
+        const rail_y: c_int = card_y + 109;
+        const rail_width: c_int = card_width - 86;
+        const segment_width: c_int = 54;
+        const travel: c_int = rail_width - 2 - segment_width;
+        const phase: c_int = @intCast((self.frame_now_ms / 18) % @as(u32, @intCast(travel * 2)));
+        const offset = if (phase <= travel) phase else travel * 2 - phase;
+
+        self.playdate.graphics.setDrawMode(.DrawModeCopy);
+        self.playdate.graphics.fillRect(0, 0, screen_width, screen_height, self.libraryBodyPatternColor());
+        self.playdate.graphics.fillRoundRect(card_x, card_y, card_width, card_height, 8, solidColor(self.backgroundColor()));
+        self.playdate.graphics.drawRoundRect(card_x, card_y, card_width, card_height, 8, 1, solidColor(self.foregroundColor()));
+
+        // A few quiet, incomplete text rules make the card read as a page
+        // being assembled rather than a generic system dialog.
+        const rules = [_]c_int{ 138, 188, 118, 166 };
+        for (rules, 0..) |width, index| {
+            const y = card_y + 57 + @as(c_int, @intCast(index)) * 8;
+            self.playdate.graphics.fillRect(card_x + 30, y, width, 2, self.loadingRulePatternColor());
+        }
+        self.playdate.graphics.drawRect(rail_x, rail_y, rail_width, 7, solidColor(self.foregroundColor()));
+        self.playdate.graphics.fillRect(rail_x + 1 + offset, rail_y + 1, segment_width, 5, self.loadingRailPatternColor());
+
+        self.playdate.graphics.setDrawMode(self.textDrawMode());
+        self.centeredUiText(title, card_y + 20, true);
+        self.centeredUiText(detail, card_y + 37, false);
+    }
+
+    /// The screen transition already explains a quick RSVP mode switch.
+    /// Preserve the restoration barrier afterward without adding another
+    /// loading treatment that could make the switch feel heavier than it is.
+    fn drawModeSwitchBackground(self: *Renderer) void {
+        self.playdate.graphics.setDrawMode(.DrawModeCopy);
+        self.playdate.graphics.fillRect(0, 0, @intCast(reader_layout.screen_width), @intCast(reader_layout.screen_height), solidColor(self.backgroundColor()));
     }
 
     pub fn invertedReadingText(self: *Renderer, font: reader_coordinator.ReadingFont, value: []const u8, text_x: c_int, text_y: c_int, rect_x: c_int, rect_y: c_int, width: c_int, height: c_int) void {
@@ -464,6 +516,14 @@ pub const Renderer = struct {
         return patternColor(if (self.theme == .dark) &library_body_pattern_dark else &library_body_pattern_light);
     }
 
+    fn loadingRulePatternColor(self: *const Renderer) pdapi.LCDColor {
+        return patternColor(if (self.theme == .dark) &loading_rule_pattern_dark else &loading_rule_pattern_light);
+    }
+
+    fn loadingRailPatternColor(self: *const Renderer) pdapi.LCDColor {
+        return patternColor(if (self.theme == .dark) &loading_rail_pattern_dark else &loading_rail_pattern_light);
+    }
+
     fn drawSettings(self: *Renderer, view: *const reader_coordinator.SettingsView) void {
         self.emphasizedText("Settings", 12, 12);
         const row_advance = @max(reader_layout.lineAdvance(self.uiFontHeight()), 24);
@@ -580,15 +640,15 @@ pub const Renderer = struct {
     }
 
     fn drawPage(self: *Renderer, view: *const reader_coordinator.PagedView) void {
-        self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
         if (view.restoring) {
-            self.text("Restoring position...", 12, 12);
+            if (view.mode_switch_loading) self.drawModeSwitchBackground() else self.drawLoadingScene("Finding your place", "Restoring reading position");
             return;
         }
         if (view.line_count == 0) {
-            self.text(if (view.reconstructing) "Restoring position..." else "Loading chapter...", 12, 12);
+            if (view.mode_switch_loading) self.drawModeSwitchBackground() else self.drawLoadingScene(if (view.reconstructing) "Finding your place" else "Loading chapter", if (view.reconstructing) "Rebuilding reading position" else "Setting the page");
             return;
         }
+        self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
         const font = self.pages_font;
         const font_height = self.readingFontHeight(font);
         const line_advance = reader_layout.lineAdvance(font_height);
@@ -704,6 +764,10 @@ pub const Renderer = struct {
     }
 
     fn drawRsvp(self: *Renderer, view: *const reader_coordinator.RsvpView) void {
+        const word = view.word orelse {
+            if (view.mode_switch_loading) self.drawModeSwitchBackground() else self.drawLoadingScene(if (view.reconstructing) "Finding your place" else "Loading chapter", if (view.reconstructing) "Rebuilding word" else "Preparing RSVP");
+            return;
+        };
         self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
         self.text(if (view.playing) "RSVP - playing" else "RSVP - paused", 12, 12);
         if (view.manual_wpm) |wpm| {
@@ -712,10 +776,6 @@ pub const Renderer = struct {
         }
         var buffer: [16]u8 = undefined;
         self.text(std.fmt.bufPrint(&buffer, "WPM: {d}", .{view.wpm}) catch "", 12, 36);
-        const word = view.word orelse {
-            self.text(if (view.reconstructing) "Rebuilding word..." else "Loading chapter...", 12, 76);
-            return;
-        };
         const font = self.rsvp_font;
         const geometry = reader_layout.rsvpGeometry(self.readingFontHeight(font));
         self.rule(0, geometry.guide_top_y, reader_layout.screen_width - 1, geometry.guide_top_y);
@@ -733,11 +793,11 @@ pub const Renderer = struct {
     }
 
     fn drawScroll(self: *Renderer, view: *const reader_coordinator.ScrollView) void {
-        self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
         if (view.restoring) {
-            self.text("Restoring position...", 12, 12);
+            if (view.mode_switch_loading) self.drawModeSwitchBackground() else self.drawLoadingScene("Finding your place", "Restoring reading position");
             return;
         }
+        self.drawProgressRails(view.progress, view.progress_visibility, view.progress_position, view.progress_scope);
         const top: c_int = @intCast(reader_layout.text_y);
         const height: c_int = @intCast(reader_layout.screen_height - reader_layout.text_y - reader_layout.reserved_edge_rows);
         self.playdate.graphics.setClipRect(@intCast(reader_layout.text_x), top, @intCast(reader_layout.text_width), height);
@@ -906,6 +966,85 @@ const library_body_pattern_dark = pdapi.LCDPattern{
     0b00100000,
     0b10000000,
     0b00000010,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+};
+
+/// Sparse foreground texture for the incomplete page rules on a loading card.
+const loading_rule_pattern_light = pdapi.LCDPattern{
+    0b11101110,
+    0b10111011,
+    0b11101110,
+    0b10111011,
+    0b11101110,
+    0b10111011,
+    0b11101110,
+    0b10111011,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+};
+
+const loading_rule_pattern_dark = pdapi.LCDPattern{
+    0b00010001,
+    0b01000100,
+    0b00010001,
+    0b01000100,
+    0b00010001,
+    0b01000100,
+    0b00010001,
+    0b01000100,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+};
+
+/// A denser dither gives the moving rail enough weight without looking like a
+/// solid, conventional progress bar.
+const loading_rail_pattern_light = pdapi.LCDPattern{
+    0b10101010,
+    0b01010101,
+    0b10101010,
+    0b01010101,
+    0b10101010,
+    0b01010101,
+    0b10101010,
+    0b01010101,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+    0xff,
+};
+
+const loading_rail_pattern_dark = pdapi.LCDPattern{
+    0b01010101,
+    0b10101010,
+    0b01010101,
+    0b10101010,
+    0b01010101,
+    0b10101010,
+    0b01010101,
+    0b10101010,
     0xff,
     0xff,
     0xff,

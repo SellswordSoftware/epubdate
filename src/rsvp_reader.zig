@@ -175,9 +175,13 @@ pub const RsvpReader = struct {
 
     pub fn previousSentence(self: *RsvpReader) Move {
         if (!self.hasWord()) return .waiting;
-        const current_sentence = self.position().sentence;
-        if (current_sentence == 0) return .at_limit;
-        const wanted = current_sentence - 1;
+        const current = self.currentSlot().?;
+        // Left first returns to the start of the sentence being read. Only a
+        // second press from that first word moves to the prior sentence.
+        const wanted = if (current.first_in_sentence) blk: {
+            if (current.position.sentence == 0) return .at_limit;
+            break :blk current.position.sentence - 1;
+        } else current.position.sentence;
         var offset = self.displayed_offset;
         while (offset != 0) {
             offset -= 1;
@@ -396,4 +400,25 @@ test "RSVP timing, WPM bounds, sentence rewind, and final word are semantic outc
     try final_word.finishInput();
     try std.testing.expectEqualStrings("last", final_word.renderState().word.?);
     try std.testing.expectEqual(RsvpReader.Move.needs_next_chapter, final_word.nextWord());
+}
+
+test "RSVP sentence rewind first returns to the current sentence start" {
+    var reader = RsvpReader{};
+    reader.begin(0);
+    reader.acceptWord(.{ .bytes = "One", .position = .{ .word = 0, .sentence = 0 } });
+    reader.acceptWord(.{ .bytes = "two", .position = .{ .word = 1, .sentence = 0 } });
+    reader.acceptWord(.{ .bytes = "three", .position = .{ .word = 2, .sentence = 0 } });
+    reader.acceptWord(.{ .bytes = "Four", .position = .{ .word = 3, .sentence = 1 } });
+    reader.acceptWord(.{ .bytes = "five", .position = .{ .word = 4, .sentence = 1 } });
+    reader.displayed_offset = 4;
+
+    try std.testing.expectEqual(RsvpReader.Move.moved, reader.previousSentence());
+    try std.testing.expectEqual(@as(u32, 3), reader.position().word);
+    try std.testing.expectEqual(@as(u32, 1), reader.position().sentence);
+
+    try std.testing.expectEqual(RsvpReader.Move.moved, reader.previousSentence());
+    try std.testing.expectEqual(@as(u32, 0), reader.position().word);
+    try std.testing.expectEqual(@as(u32, 0), reader.position().sentence);
+
+    try std.testing.expectEqual(RsvpReader.Move.at_limit, reader.previousSentence());
 }

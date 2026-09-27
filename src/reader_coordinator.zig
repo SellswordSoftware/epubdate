@@ -248,6 +248,9 @@ pub const ReaderCoordinator = struct {
     page_transition_state: page_transition.State = .{},
     restore_transition_pending: bool = false,
     scroll_restore_pending: ?ScrollRestoreTarget = null,
+    /// Marks the brief visual handoff between Pages/Scroll and RSVP. Unlike a
+    /// normal chapter load, this uses a compact renderer veil.
+    mode_switch_loading: bool = false,
     /// Set only for RSVP -> Pages/Scroll restoration. It is deliberately not
     /// used by ordinary saved-position or chapter reconstruction.
     rsvp_return_fast_restore: bool = false,
@@ -324,6 +327,7 @@ pub const ReaderCoordinator = struct {
         self.page_transition_state = .{};
         self.restore_transition_pending = false;
         self.scroll_restore_pending = null;
+        self.mode_switch_loading = false;
         self.rsvp_return_fast_restore = false;
         self.word_spotlight_nonce = 0;
         self.word_highlight_dismiss_nonce = 0;
@@ -578,6 +582,7 @@ pub const ReaderCoordinator = struct {
         self.page_transition_state.cancel();
         self.restore_transition_pending = false;
         self.scroll_restore_pending = null;
+        self.mode_switch_loading = false;
         self.rsvp_return_fast_restore = false;
         self.clearResetHold();
         self.returnToLibrary();
@@ -1034,6 +1039,7 @@ pub const ReaderCoordinator = struct {
         self.cancelChapter();
         self.scroll_chapter_end_overscroll_px = 0;
         self.scroll_chapter_start_overscroll_px = 0;
+        self.mode_switch_loading = false;
         self.rsvp_return_fast_restore = false;
         self.chapter_open = .{ .index = index, .action = action };
         self.scroll_align_chapter_end = self.mode == .paged and self.paged_presentation == .scroll and action == .rescan_to_last_page;
@@ -1147,7 +1153,10 @@ pub const ReaderCoordinator = struct {
                 }
                 if (self.mode == .rsvp and self.rsvp_reader.hasWord()) {
                     self.telemetry.setChapterEvents(self.rsvp_reader.event_count);
-                    if (self.pending_mode_word_ordinal == self.rsvp_reader.position().word) self.pending_mode_word_ordinal = null;
+                    if (self.pending_mode_word_ordinal == self.rsvp_reader.position().word) {
+                        self.pending_mode_word_ordinal = null;
+                        self.mode_switch_loading = false;
+                    }
                     self.rsvp_reader.wordBecameDrawable(now_ms);
                     return .{ .worked = true, .position_changed = true };
                 }
@@ -1185,7 +1194,10 @@ pub const ReaderCoordinator = struct {
                         self.telemetry.setChapterEvents(self.rsvp_reader.event_count);
                         var position_changed = false;
                         if (self.rsvp_reader.hasWord()) {
-                            if (self.pending_mode_word_ordinal == self.rsvp_reader.position().word) self.pending_mode_word_ordinal = null;
+                            if (self.pending_mode_word_ordinal == self.rsvp_reader.position().word) {
+                                self.pending_mode_word_ordinal = null;
+                                self.mode_switch_loading = false;
+                            }
                             self.rsvp_reader.wordBecameDrawable(now_ms);
                             position_changed = true;
                         }
@@ -1852,9 +1864,13 @@ pub const ReaderCoordinator = struct {
                     self.scroll_restore_pending = if (self.paged_presentation == .scroll) .{ .word = target_word } else null;
                     self.paged.pending_selection = .{ .ordinal = target_word };
                     self.openChapter(self.chapter_index, .{ .word_rescan = target_word });
+                    self.mode_switch_loading = true;
                     self.rsvp_return_fast_restore = returning_from_rsvp;
                 },
-                .rsvp => self.openChapter(self.chapter_index, .{ .rsvp_rescan = .{ .word = target_word } }),
+                .rsvp => {
+                    self.openChapter(self.chapter_index, .{ .rsvp_rescan = .{ .word = target_word } });
+                    self.mode_switch_loading = true;
+                },
             }
             self.requestPositionSave();
         }
@@ -2168,6 +2184,7 @@ pub const ReaderCoordinator = struct {
         if (self.mode != .paged or !self.paged.current_ready) return;
         if (!self.paged.fulfillPendingSelection()) return;
         if (self.pending_mode_word_ordinal == self.paged.selected_word_ordinal) self.pending_mode_word_ordinal = null;
+        self.mode_switch_loading = false;
         self.rsvp_return_fast_restore = false;
         if (self.paged_presentation == .scroll) self.paged.beginScrollAtWord(self.paged.selected_word_ordinal orelse self.currentPagedWordOrdinal(), self.scrollGeometry());
         self.requestPositionSave();
@@ -2218,6 +2235,7 @@ pub const ReaderCoordinator = struct {
             // before clamping to the final viewport. Keep that provisional
             // beginning hidden just like an ordinary saved-position restore.
             .restoring = self.scroll_restore_pending != null or self.scroll_align_chapter_end,
+            .mode_switch_loading = self.mode_switch_loading,
             .chapter_end_overscroll_px = self.scroll_chapter_end_overscroll_px,
             .chapter_start_overscroll_px = self.scroll_chapter_start_overscroll_px,
             .chapter_transition_nonce = self.scroll_chapter_transition_nonce,
@@ -2270,6 +2288,7 @@ pub const ReaderCoordinator = struct {
             .lines = lines,
             .line_count = line_count,
             .restoring = restoring,
+            .mode_switch_loading = self.mode_switch_loading,
             .selected_span = selected_span,
             .spotlight_nonce = self.word_spotlight_nonce,
             .dismiss_span = dismiss_span,
@@ -2293,6 +2312,7 @@ pub const ReaderCoordinator = struct {
             .anchor = if (anchor) |span| .{ .start = span.start, .end = span.end } else null,
             .waiting = state.waiting,
             .reconstructing = self.rsvp_reader.isReconstructing(),
+            .mode_switch_loading = self.mode_switch_loading,
             .playing = state.playing,
             .wpm = state.wpm,
             .manual_wpm = if (!state.playing and !self.crank_docked) self.manual_rsvp_wpm.wpm(self.frame_now_ms) else null,
@@ -2646,6 +2666,7 @@ pub const PagedView = struct {
     lines: [pagination.max_lines][]const u8,
     line_count: u8,
     restoring: bool = false,
+    mode_switch_loading: bool = false,
     selected_span: ?pagination.PageCache.WordSpan,
     spotlight_nonce: u32 = 0,
     dismiss_span: ?pagination.PageCache.WordSpan = null,
@@ -2672,6 +2693,7 @@ pub const PageTransitionView = struct {
 pub const ScrollView = struct {
     window: paged_reader.PagedReader.ScrollRenderState,
     restoring: bool = false,
+    mode_switch_loading: bool = false,
     chapter_end_overscroll_px: u16 = 0,
     chapter_start_overscroll_px: u16 = 0,
     chapter_transition_nonce: u32 = 0,
@@ -2688,6 +2710,7 @@ pub const RsvpView = struct {
     anchor: ?ByteSpan = null,
     waiting: bool,
     reconstructing: bool = false,
+    mode_switch_loading: bool = false,
     playing: bool,
     wpm: u16,
     manual_wpm: ?u16 = null,
@@ -2977,9 +3000,13 @@ test "RSVP handoff hides a provisional Pages view until its target word resolves
     coordinator.paged.slots[0] = .{ .role = .displayed, .chapter = 0, .page = 0 };
     coordinator.pending_mode_word_ordinal = 20;
     coordinator.paged.pending_selection = .{ .ordinal = 20 };
+    coordinator.mode_switch_loading = true;
 
     switch (coordinator.renderModel()) {
-        .paged => |view| try std.testing.expect(view.restoring),
+        .paged => |view| {
+            try std.testing.expect(view.restoring);
+            try std.testing.expect(view.mode_switch_loading);
+        },
         else => return error.TestUnexpectedResult,
     }
 
@@ -3003,6 +3030,7 @@ test "RSVP handoff installs a Scroll word restoration barrier" {
 
     coordinator.switchReadingMode(0);
     try std.testing.expectEqual(ReadingMode.paged, coordinator.mode);
+    try std.testing.expect(coordinator.mode_switch_loading);
     try std.testing.expectEqual(@as(?ScrollRestoreTarget, .{ .word = target_word }), coordinator.scroll_restore_pending);
 }
 
